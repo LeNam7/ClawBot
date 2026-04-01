@@ -34,7 +34,7 @@ const COMPLEX_PATTERNS = [
 
 export function classifyComplexity(
   message: string,
-  history: Array<{ role: string; content: string }>
+  history: Array<{ role: string; content: any }>
 ): ComplexityLevel {
   const trimmed = message.trim();
 

@@ -5,10 +5,12 @@ import { SessionManager } from "./session/manager.js";
 import { createAIClient } from "./ai/factory.js";
 import { ChannelRegistry } from "./channels/registry.js";
 import { TelegramChannel } from "./channels/telegram/index.js";
+import { CLIChannel } from "./channels/cli/index.js";
 import { handleInbound } from "./pipeline/handler.js";
 import type { HandlerDeps } from "./pipeline/handler.js";
 import { createServer } from "./gateway/server.js";
 import { CronManager } from "./plugins/cron.js";
+import { SecurityManager } from "./core/security.js";
 import path from "node:path";
 
 async function main() {
@@ -31,14 +33,22 @@ async function main() {
   });
   console.log(`[clawbot] ai provider: ${config.aiProvider}`);
 
-  // 4. Channels
+  // 4. Security & Channels
+  const securityManager = new SecurityManager();
   const registry = new ChannelRegistry();
-  const telegram = new TelegramChannel(
-    config.telegramBotToken,
-    config.streamThrottleMs,
-    config.allowedUserIds
-  );
-  registry.register(telegram);
+
+  if (config.telegramBotToken) {
+    const telegram = new TelegramChannel(
+      config.telegramBotToken,
+      config.streamThrottleMs,
+      securityManager
+    );
+    registry.register(telegram);
+  }
+
+  // CLI Channel
+  const cli = new CLIChannel(securityManager);
+  registry.register(cli);
 
   // 5. Pipeline deps
   const deps: HandlerDeps = {
@@ -47,7 +57,11 @@ async function main() {
     channelRegistry: registry,
     config,
   };
-  telegram.onMessage = (msg) => handleInbound(msg, deps);
+  
+  // Gắn event onMessage chung cho tất cả channel
+  registry.getAll().forEach((channel) => {
+    channel.onMessage = (msg) => handleInbound(msg, deps);
+  });
 
   // 6. Cron manager
   const dataDir = path.dirname(config.dbPath);
@@ -69,17 +83,22 @@ async function main() {
 
   deps.cronManager = cronManager;
 
-  // 7. Command deps
-  telegram.setCommandDeps({
-    sessionManager,
-    config,
-    aiClient,
-    channelRegistry: registry,
-    cronManager,
-  });
+  // 7. Command deps (dành riêng cho nền tảng có bot command như telegram)
+  const tgChannel = registry.getAll().find(c => c.id === "telegram") as TelegramChannel | undefined;
+  if (tgChannel) {
+    tgChannel.setCommandDeps({
+      sessionManager,
+      config,
+      aiClient,
+      channelRegistry: registry,
+      cronManager,
+    });
+  }
 
-  // 8. Start
-  await telegram.start();
+  // 8. Start channels
+  const startPromises = registry.getAll().map(c => c.start());
+  await Promise.all(startPromises);
+
   const server = await createServer(config.gatewayPort);
 
   console.log(`[clawbot] model: ${config.model}`);
@@ -96,7 +115,11 @@ async function main() {
   const shutdown = async () => {
     console.log("\n[clawbot] shutting down...");
     cronManager.stopAll();
-    await telegram.stop();
+    
+    for (const channel of registry.getAll()) {
+      await channel.stop();
+    }
+    
     await server.close();
     db.close();
     process.exit(0);

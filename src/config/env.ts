@@ -40,6 +40,8 @@ const schema = z.object({
 
   // ── Access control ────────────────────────────────────────────────────────
   ALLOWED_USER_IDS: z.string().default(""),
+  // Dùng cho Pairing Mode. Nếu để trống, ai không nằm trong ALLOWED_USER_IDS sẽ bị block cứng.
+  PAIRING_CODE: z.string().default(""),
   BASH_TIMEOUT_MS: z.coerce.number().default(30000),
 
   // ── Exec approval ─────────────────────────────────────────────────────────
@@ -131,6 +133,7 @@ export const config = {
   allowedUserIds: parsed.data.ALLOWED_USER_IDS
     ? parsed.data.ALLOWED_USER_IDS.split(",").map((s) => s.trim()).filter(Boolean)
     : [],
+  pairingCode: parsed.data.PAIRING_CODE,
   bashTimeoutMs: parsed.data.BASH_TIMEOUT_MS,
   bashApprovalMode: parsed.data.BASH_APPROVAL_MODE,
 

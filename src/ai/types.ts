@@ -4,13 +4,14 @@ export type MessageRole = "user" | "assistant";
 
 export interface MessageParam {
   role: MessageRole;
-  content: string;
+  content: any; // Allow Anthropic array objects (text, tool_use, tool_result)
 }
 
 export interface AIStreamEvent {
   type: "delta" | "done" | "error";
   delta?: string;
   fullText?: string;
+  assistantMessages?: MessageParam[]; // Trả về mảng messages hoàn chỉnh của turn này
   error?: Error;
 }
 

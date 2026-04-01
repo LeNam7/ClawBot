@@ -121,8 +121,9 @@ const TOOLS: ToolDefinition[] = [
   {
     name: "run_bash",
     description:
-      "Execute a shell command and return its output. Use when the user asks to run a command, check system info, list files, etc. " +
-      "Dangerous commands (rm -rf, format, etc.) will require user approval before execution.",
+      "Execute a shell command. By default, this runs securely in a Docker sandbox (node:22-alpine). " +
+      "If the sandbox is not available, it FALLS BACK to executing NATIVELY on the HOST OS. " +
+      "Since the host is Windows, you MUST use PowerShell commands if the execution is native.",
     input_schema: {
       type: "object",
       properties: {
@@ -243,22 +244,13 @@ const TOOLS: ToolDefinition[] = [
   {
     name: "list_dir",
     description:
-      "Liệt kê cấu trúc thư mục dạng cây đệ quy. " +
-      "Hỗ trợ cả đường dẫn tuyệt đối (C:\\Users\\... hoặc /home/...) và tương đối trong workspace. " +
-      "Dùng khi user muốn xem cấu trúc project, folder, hoặc bất kỳ thư mục nào trên hệ thống. " +
-      "Tự động bỏ qua node_modules, .git, dist và các thư mục nặng.",
+      "Liệt kê nội dung thư mục trong workspace. Dùng để xem cấu trúc project.",
     input_schema: {
       type: "object",
       properties: {
         path: {
           type: "string",
-          description:
-            "Đường dẫn thư mục. Có thể là tuyệt đối (ví dụ 'C:\\Users\\PC\\myproject' hoặc '/home/user/project') " +
-            "hoặc tương đối trong workspace (ví dụ '.' hoặc 'src'). Mặc định là '.' (workspace root).",
-        },
-        depth: {
-          type: "number",
-          description: "Độ sâu đệ quy tối đa (1-5). Mặc định 3. Dùng depth=1 để xem nhanh top-level.",
+          description: "Đường dẫn thư mục tương đối, mặc định là '.' (root workspace)",
         },
       },
       required: [],
@@ -323,15 +315,11 @@ export async function handleInbound(
   // Register abort controller
   const controller = registerStream(msg.chatId);
 
-  // Ref đến stream handle hiện tại — sendProgress sẽ update vào đây thay vì gửi tin nhắn mới
-  const streamRef: { current: import("../channels/types.js").StreamHandle | null } = { current: null };
-
-  // Helper: update status vào stream message đang hiển thị
-  const sendProgress = (text: string): void => {
-    if (streamRef.current) {
-      streamRef.current.update(text);
-    }
-    // Nếu chưa có streamHandle (edge case), bỏ qua — tránh gửi tin nhắn rời
+  // Helper: gửi progress update liên tục — user biết clawbot đang làm gì
+  const sendProgress = async (text: string) => {
+    try {
+      await channel.send({ channel: msg.channel, chatId: msg.chatId, text, isFinal: true });
+    } catch { /* ignore */ }
   };
 
   // Tool executor
@@ -343,6 +331,7 @@ export async function handleInbound(
       switch (name) {
         case "create_reminder": {
           if (!cronManager) return "Reminder feature is not available.";
+          await sendProgress(`Đang tạo lịch nhắc...`);
           const job = cronManager.add(msg.chatId, msg.userId, i.cron_expression, i.message);
           if (job) {
             return `Reminder created. ID: ${job.id.slice(-6)}. Schedule: "${i.cron_expression}". Message: "${i.message}"`;
@@ -364,7 +353,7 @@ export async function handleInbound(
         case "run_bash": {
           const command = i.command ?? "";
           const needsApproval = shouldRequireApproval(command, config.bashApprovalMode);
-          if (!needsApproval) sendProgress(`Đang chạy: \`${command.slice(0, 80)}\``);
+          if (!needsApproval) await sendProgress(`Đang chạy: \`${command.slice(0, 80)}\``);
 
           if (needsApproval) {
             if (!channel.sendApprovalMessage) {
@@ -377,7 +366,7 @@ export async function handleInbound(
 
             const result = await promise;
             if (result === "approved") {
-              return await runBash(command, config.bashTimeoutMs);
+              return await runBash(command, config.bashTimeoutMs, config.workspaceDir);
             } else if (result === "rejected") {
               return `Execution rejected by user: ${command}`;
             } else {
@@ -385,25 +374,25 @@ export async function handleInbound(
             }
           }
 
-          return await runBash(command, config.bashTimeoutMs);
+          return await runBash(command, config.bashTimeoutMs, config.workspaceDir);
         }
 
         case "fetch_url":
-          sendProgress(`Đang đọc: ${(i.url ?? "").slice(0, 60)}...`);
+          await sendProgress(`Đang đọc: ${(i.url ?? "").slice(0, 60)}...`);
           return await fetchUrl(i.url ?? "");
 
         case "web_search":
-          sendProgress(`Đang tìm kiếm: "${i.query ?? ""}"`);
+          await sendProgress(`Đang tìm kiếm: "${i.query ?? ""}"`);
           return await webSearch(i.query ?? "");
 
         case "memory_search":
-          sendProgress(`Đang tìm trong memory: "${i.query ?? ""}"`);
+          await sendProgress(`Đang tìm trong memory: "${i.query ?? ""}"`);
           return await searchMemory(i.query ?? "", memoriesDir);
 
         case "generate_image": {
           const prompt = i.prompt ?? "";
           const size = (i.size as "1024x1024" | "1792x1024" | "1024x1792") ?? "1024x1024";
-          sendProgress(`Đang tạo ảnh: "${prompt.slice(0, 60)}"...`);
+          await sendProgress(`Đang tạo ảnh: "${prompt.slice(0, 60)}"...`);
           try {
             const result = await generateImage(prompt, config.imageApiKey, size);
             await channel.sendPhoto?.(msg.chatId, result.buffer, undefined);
@@ -414,12 +403,12 @@ export async function handleInbound(
         }
 
         case "read_file":
-          sendProgress(`Đang đọc file: ${i.path ?? ""}`);
+          await sendProgress(`Đang đọc file: ${i.path ?? ""}`);
           return readFile(config.workspaceDir, i.path ?? "");
 
         case "write_file": {
           const filePath = i.path ?? "";
-          sendProgress(`Đang tạo file: ${filePath}`);
+          await sendProgress(`Đang tạo file: ${filePath}`);
           const result = await writeFile(config.workspaceDir, filePath, i.content ?? "");
           // Nếu ghi thành công, gửi file thật cho user
           if (result.startsWith("✅") && channel.sendFileBuffer) {
@@ -435,12 +424,9 @@ export async function handleInbound(
           return result;
         }
 
-        case "list_dir": {
-          const dirPath = i.path ?? ".";
-          const dirDepth = i.depth ? parseInt(i.depth) : 3;
-          sendProgress(`Đang xem cấu trúc: ${dirPath}`);
-          return listDir(config.workspaceDir, dirPath, dirDepth);
-        }
+        case "list_dir":
+          await sendProgress(`Đang xem thư mục: ${i.path ?? "."}`);
+          return listDir(config.workspaceDir, i.path ?? ".");
 
         case "export_chat": {
           const turns = sessionManager.getHistory(sessionKey);
@@ -464,21 +450,19 @@ export async function handleInbound(
   // ─── Load soul/user/memory files ────────────────────────────────────────────
   const dataDir = path.dirname(config.dbPath);
 
-  async function safeRead(filePath: string): Promise<string> {
-    try { return await fs.promises.readFile(filePath, "utf8"); } catch { return ""; }
+  function safeRead(filePath: string): string {
+    try { return fs.readFileSync(filePath, "utf8"); } catch { return ""; }
   }
 
   // Chỉ load 2000 ký tự đầu mỗi file để tránh system prompt quá nặng
-  const safeReadTrimmed = async (filePath: string, maxChars = 2000): Promise<string> => {
-    const content = await safeRead(filePath);
+  const safeReadTrimmed = (filePath: string, maxChars = 2000): string => {
+    const content = safeRead(filePath);
     return content.length > maxChars ? content.slice(0, maxChars) + "\n...(truncated)" : content;
   };
 
-  const [soulContent, userContent, memoryContent] = await Promise.all([
-    safeReadTrimmed(path.join(dataDir, "soul.md"), 800),
-    safeReadTrimmed(path.join(dataDir, "user.md"), 800),
-    safeReadTrimmed(path.join(dataDir, "memory.md"), 1200)
-  ]);
+  const soulContent = safeReadTrimmed(path.join(dataDir, "soul.md"), 800);
+  const userContent = safeReadTrimmed(path.join(dataDir, "user.md"), 800);
+  const memoryContent = safeReadTrimmed(path.join(dataDir, "memory.md"), 1200);
 
   // ─── Build dynamic system prompt với context thời gian thực ────────────────
   const now = new Date();
@@ -517,15 +501,15 @@ export async function handleInbound(
 
   const dynamicSystemPrompt = config.systemPrompt + soulBlock + userBlock + memoryBlock + dynamicContext + thinkingInstruction;
 
-  // Begin streaming — tự động retry khi server overloaded (429/529)
+  // Begin streaming — tự động retry khi server overloaded (529)
   let overloadAttempt = 0;
   const MAX_OVERLOAD_RETRIES = 3;
   let fullText = "";
+  let finalAssistantMessages: any[] | undefined = undefined;
 
   try {
     while (true) {
-      const streamHandle = channel.beginStream?.(msg.chatId) ?? null;
-      streamRef.current = streamHandle;
+      const streamHandle = channel.beginStream?.(msg.chatId);
       fullText = "";
 
       try {
@@ -547,6 +531,7 @@ export async function handleInbound(
             streamHandle?.update(fullText);
           } else if (event.type === "done") {
             fullText = event.fullText ?? fullText;
+            finalAssistantMessages = event.assistantMessages;
           } else if (event.type === "error") {
             throw event.error;
           }
@@ -558,7 +543,7 @@ export async function handleInbound(
         }
 
         await streamHandle?.finalize();
-        break; // thành công — thoát retry loop
+        break; // thành công
 
       } catch (err) {
         const isAbort =
@@ -582,7 +567,7 @@ export async function handleInbound(
 
         if (isOverloaded && overloadAttempt < MAX_OVERLOAD_RETRIES) {
           overloadAttempt++;
-          const delayMs = overloadAttempt * 5000; // 5s → 10s → 15s
+          const delayMs = overloadAttempt * 5000;
           console.warn(`[pipeline] Overloaded, retry ${overloadAttempt}/${MAX_OVERLOAD_RETRIES} in ${delayMs / 1000}s`);
           await new Promise((r) => setTimeout(r, delayMs));
           continue;
@@ -603,8 +588,18 @@ export async function handleInbound(
     deregisterStream(msg.chatId);
   }
 
-  if (fullText && !opts.noHistory) {
-    sessionManager.appendAssistantTurn(sessionKey, fullText);
+  if (!opts.noHistory) {
+    if (finalAssistantMessages && finalAssistantMessages.length > 0) {
+      for (const message of finalAssistantMessages) {
+        if (message.role === "assistant") {
+          sessionManager.appendAssistantTurn(sessionKey, message.content);
+        } else if (message.role === "user") {
+          sessionManager.appendUserTurn(sessionKey, message.content);
+        }
+      }
+    } else if (fullText) {
+      sessionManager.appendAssistantTurn(sessionKey, fullText);
+    }
   }
 }
 

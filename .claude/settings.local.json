@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/PC/openclaw/src/providers/**)",
+      "Read(//c/Users/PC/openclaw/**)",
+      "Bash(cmd.exe /d /c \"start \"\"\"\" \"\"C:\\\\Users\\\\PC\\\\.openclaw\\\\gateway.cmd\"\"\")",
+      "Bash(powershell.exe -Command \"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq ''node.exe'' -and $_.CommandLine -like ''*openclaw*gateway*'' } | Select-Object ProcessId, CommandLine\")",
+      "Bash(powershell.exe -Command \"Get-Process node | Select-Object Id, StartTime, CPU\")",
+      "Bash(powershell.exe -Command \"Start-Process ''cmd.exe'' -ArgumentList ''/d /c C:\\\\Users\\\\PC\\\\.openclaw\\\\gateway.cmd'' -WindowStyle Hidden\")",
+      "Bash(powershell.exe -Command \"Get-Process node | Select-Object Id, StartTime\")",
+      "Bash(node -e \":*)",
+      "Bash(node -e \"const c=require\\(''crypto''\\);console.log\\(c.randomBytes\\(32\\).toString\\(''hex''\\)\\)\")"
+    ]
+  }
+}

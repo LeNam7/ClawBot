@@ -1,20 +1,40 @@
-// Memory search — tìm kiếm keyword trong lịch sử chat đã lưu
-
 import fs from "node:fs";
 import path from "node:path";
+import { getEmbedding, cosineSimilarity } from "./vector.js";
 
 const MAX_RESULTS = 3;
-const MAX_EXCERPT_LENGTH = 400;
+const SIMILARITY_THRESHOLD = 0.3; // ngưỡng chấp nhận mức độ giống nhau (trên 30%)
 
-export interface MemoryResult {
-  filename: string;
-  excerpt: string;
-  score: number;
+interface VectorCache {
+  [filename: string]: {
+    mtime: number;
+    chunks: { text: string; embedding: number[] }[];
+  };
+}
+
+let cache: VectorCache | null = null;
+
+// Tách đoạn văn bản vừa phải để tạo vector được chính xác thay vì nhét nguyên file vào.
+function chunkText(text: string): string[] {
+  const rawChunks = text.split(/\n\s*\n/);
+  const chunks = [];
+  let currentChunk = "";
+  
+  for (const c of rawChunks) {
+    if ((currentChunk.length + c.length) > 1000) {
+      if (currentChunk) chunks.push(currentChunk.trim());
+      currentChunk = c;
+    } else {
+      currentChunk += (currentChunk ? "\n\n" : "") + c;
+    }
+  }
+  if (currentChunk) chunks.push(currentChunk.trim());
+  return chunks.filter(c => c.length > 20); // bỏ chunk quá ngắn
 }
 
 /**
- * Tìm kiếm keyword trong các file memory đã lưu.
- * Trả về các đoạn liên quan nhất.
+ * Tìm kiếm theo dạng Semantic Search Vector.
+ * Lần đầu chạy sẽ quét toàn bộ thư mục memories (nếu chưa có cache index)
  */
 export async function searchMemory(query: string, memoriesDir: string): Promise<string> {
   if (!fs.existsSync(memoriesDir)) {
@@ -24,116 +44,107 @@ export async function searchMemory(query: string, memoriesDir: string): Promise<
   const files = fs.readdirSync(memoriesDir)
     .filter((f) => f.endsWith(".md"))
     .sort()
-    .reverse(); // mới nhất trước
+    .reverse(); // Ưu tiên xếp cái mới nhất lúc đọc ra
 
   if (files.length === 0) {
     return "Chưa có memory nào được lưu.";
   }
 
-  const keywords = extractKeywords(query);
-  if (keywords.length === 0) {
-    return "Không thể trích xuất từ khóa từ truy vấn.";
+  const indexPath = path.join(memoriesDir, "vector_index.json");
+  
+  // 1. Tải cache
+  if (!cache) {
+    if (fs.existsSync(indexPath)) {
+      try { 
+        cache = JSON.parse(fs.readFileSync(indexPath, "utf8")); 
+      } catch { 
+        cache = {}; 
+      }
+    } else { 
+      cache = {}; 
+    }
   }
 
-  const results: MemoryResult[] = [];
+  let updatedIdx = false;
+  const currentFiles = new Set(files);
 
-  // Giới hạn tìm kiếm trong 50 file gần nhất để tăng tốc, và đọc file song song
-  const filesToSearch = files.slice(0, 50);
-  const fileReads = await Promise.all(
-    filesToSearch.map(async (file) => {
-      try {
-        const filePath = path.join(memoriesDir, file);
-        return { file, content: await fs.promises.readFile(filePath, "utf8") };
-      } catch {
-        return null;
+  // 2. Vectorize những file mới hoặc bị chỉnh sửa
+  for (const file of files) {
+    const filePath = path.join(memoriesDir, file);
+    let mtime: number;
+    try {
+      mtime = fs.statSync(filePath).mtimeMs;
+    } catch { continue; }
+    
+    // Nếu chưa có trong cache hoặc file đã thay đổi -> tạo lại index file đó.
+    if (!cache![file] || cache![file].mtime < mtime) {
+      let content = "";
+      try { content = fs.readFileSync(filePath, "utf8"); } catch { continue; }
+      
+      const chunksStr = chunkText(content);
+      const chunks = [];
+      for (const text of chunksStr) {
+        try {
+          const embedding = await getEmbedding(text);
+          if (embedding.length > 0) chunks.push({ text, embedding });
+        } catch (e) {
+          console.error(`Lỗi trích xuất (Embedding) chunk:`, e);
+        }
       }
-    })
-  );
+      cache![file] = { mtime, chunks };
+      updatedIdx = true;
+    }
+  }
 
-  for (const item of fileReads) {
-    if (!item) continue;
-    const { file, content } = item;
+  // 3. Xoá rác file dư thừa khỏi cache để giảm RAM
+  for (const knownFile of Object.keys(cache!)) {
+    if (!currentFiles.has(knownFile)) {
+      delete cache![knownFile];
+      updatedIdx = true;
+    }
+  }
 
-    const score = scoreContent(content, keywords);
-    if (score === 0) continue;
+  if (updatedIdx) {
+    fs.writeFileSync(indexPath, JSON.stringify(cache));
+  }
 
-    const excerpt = extractExcerpt(content, keywords);
-    results.push({ filename: file, excerpt, score });
+  // 4. Nhúng ngữ nghĩa trên Câu Hỏi
+  let queryEmbedding: number[];
+  try {
+    queryEmbedding = await getEmbedding(query);
+  } catch (err) {
+    return "Lỗi bộ nhớ AI nhúng: Không thể nhúng câu truy vấn hiện tại để lấy vector đối chiếu.";
+  }
+
+  // 5. Tìm kiếm (Cosine Similarity Loop)
+  const results: { filename: string; text: string; score: number }[] = [];
+  
+  for (const [filename, fileData] of Object.entries(cache!)) {
+    for (const chunk of fileData.chunks) {
+      const score = cosineSimilarity(queryEmbedding, chunk.embedding);
+      if (score >= SIMILARITY_THRESHOLD) {
+        results.push({ filename, text: chunk.text, score });
+      }
+    }
   }
 
   if (results.length === 0) {
-    return `Không tìm thấy memory liên quan đến: "${query}"`;
+    return `Không có ký ức (memory) nào khớp đủ độ đo ngữ nghĩa (>${Math.round(SIMILARITY_THRESHOLD * 100)}%) với: "${query}"`;
   }
 
-  // Sort by score descending
+  // Sort giảm dần điểm tương đồng Cosine
   results.sort((a, b) => b.score - a.score);
-
   const topResults = results.slice(0, MAX_RESULTS);
-  const lines = [`Tìm thấy ${results.length} memory liên quan đến: "${query}"\n`];
 
+  const lines = [`[Vector DB] Tìm thấy ${topResults.length}/${results.length} ký ức phù hợp với ngữ nghĩa: "${query}"\n`];
+  
   for (const r of topResults) {
-    // Extract date from filename (format: YYYY-MM-DD-HHMM-...)
     const dateMatch = r.filename.match(/^(\d{4}-\d{2}-\d{2})/);
     const date = dateMatch ? dateMatch[1] : r.filename;
-    lines.push(`**[${date}]** (${r.filename})`);
-    lines.push(r.excerpt);
-    lines.push("");
+    lines.push(`**[${date}]** (${r.filename}) - (Độ tương đồng: ${Math.round(r.score * 100)}%)`);
+    lines.push(r.text);
+    lines.push("---");
   }
 
   return lines.join("\n");
-}
-
-function extractKeywords(query: string): string[] {
-  // Remove common stopwords, split into words
-  const stopwords = new Set([
-    "là", "và", "của", "cho", "với", "về", "trong", "có", "không", "được",
-    "một", "các", "này", "đó", "the", "a", "an", "is", "are", "was", "were",
-    "in", "on", "at", "to", "for", "of", "and", "or", "but", "not",
-  ]);
-
-  return query
-    .toLowerCase()
-    .replace(/[^\w\sàáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỷỹ]/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 2 && !stopwords.has(w));
-}
-
-function scoreContent(content: string, keywords: string[]): number {
-  const lower = content.toLowerCase();
-  let score = 0;
-  for (const kw of keywords) {
-    const occurrences = (lower.match(new RegExp(kw, "g")) ?? []).length;
-    score += occurrences;
-  }
-  return score;
-}
-
-function extractExcerpt(content: string, keywords: string[]): string {
-  const lines = content.split("\n");
-  const lower = content.toLowerCase();
-
-  // Find the line with the highest keyword density
-  let bestLineIdx = 0;
-  let bestScore = 0;
-
-  for (let i = 0; i < lines.length; i++) {
-    const lineLower = lines[i].toLowerCase();
-    let score = 0;
-    for (const kw of keywords) {
-      if (lineLower.includes(kw)) score++;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestLineIdx = i;
-    }
-  }
-
-  // Return context: best line + 2 lines before/after
-  const start = Math.max(0, bestLineIdx - 2);
-  const end = Math.min(lines.length, bestLineIdx + 4);
-  const excerpt = lines.slice(start, end).join("\n").trim();
-
-  return excerpt.length > MAX_EXCERPT_LENGTH
-    ? excerpt.slice(0, MAX_EXCERPT_LENGTH) + "..."
-    : excerpt;
 }

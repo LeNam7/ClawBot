@@ -29,38 +29,61 @@ export class SessionManager {
     const turns = this.store.getTurns(key, this.maxTurns * 2);
     const messages: MessageParam[] = turns.map((t) => ({
       role: t.role as MessageParam["role"],
-      content: typeof t.content === "string" ? t.content : JSON.stringify(t.content),
+      content: t.content,
     }));
     return this.pruneByTokens(messages);
   }
 
   /**
    * Cắt bớt lịch sử từ đầu nếu tổng token vượt quá maxContextTokens.
-   * Xóa theo cặp (user + assistant) để giữ đúng alternation pattern.
-   * Luôn giữ lại ít nhất 2 turns cuối.
+   * Luôn giữ lại cặp turn cuối cùng để tránh mất ngữ cảnh gần nhất.
    */
   private pruneByTokens(messages: MessageParam[]): MessageParam[] {
     const budget = this.maxContextTokens * CHARS_PER_TOKEN; // chars
 
-    let totalChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+    let totalChars = messages.reduce((sum, m) => {
+      if (typeof m.content === "string") return sum + m.content.length;
+      return sum + JSON.stringify(m.content).length;
+    }, 0);
 
     if (totalChars <= budget) return messages;
 
+    // Xóa từ đầu (cũ nhất) cho đến khi vừa ngân sách, giữ ít nhất 2 turns cuối
     const result = [...messages];
-    // Xóa 2 messages mỗi lần (1 cặp user+assistant) để không phá vỡ alternation
+    let removedCount = 0;
     while (result.length > 2 && totalChars > budget) {
-      const first = result.shift()!;
-      totalChars -= first.content.length;
-      if (result.length > 2) {
-        const second = result.shift()!;
-        totalChars -= second.content.length;
+      const removed = result.shift()!;
+      const removedContentLength = typeof removed.content === "string" 
+        ? removed.content.length 
+        : JSON.stringify(removed.content).length;
+      totalChars -= removedContentLength;
+      removedCount++;
+    }
+
+    // Đánh dấu cho Model biết một phần lịch sử đã bị cắt
+    if (removedCount > 0 && result.length > 0) {
+      for (let i = 0; i < result.length; i++) {
+        if (result[i].role === "user") {
+          const prefix = `_[Hệ thống: ${removedCount} đoạn hội thoại cũ nhất đã bị đưa vào lưu trữ (archive) để giảm giới hạn Context Window. Hãy tiếp tục dựa trên ngữ cảnh còn lại.]_\n\n`;
+          if (typeof result[i].content === "string") {
+            result[i].content = prefix + result[i].content;
+          } else if (Array.isArray(result[i].content)) {
+            // Giả định content là mảng các block của Anthropic (có text/tool_result/etc)
+            // Ta chèn block text vào đầu mảng
+            result[i].content = [
+              { type: "text", text: prefix },
+              ...result[i].content
+            ];
+          }
+          break;
+        }
       }
     }
 
     return result;
   }
 
-  appendUserTurn(key: SessionKey, content: string) {
+  appendUserTurn(key: SessionKey, content: any) {
     this.store.appendTurn(key, {
       role: "user",
       content,
@@ -68,7 +91,7 @@ export class SessionManager {
     });
   }
 
-  appendAssistantTurn(key: SessionKey, content: string) {
+  appendAssistantTurn(key: SessionKey, content: any) {
     this.store.appendTurn(key, {
       role: "assistant",
       content,

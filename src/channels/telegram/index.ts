@@ -7,6 +7,7 @@ import { formatForTelegram } from "./formatter.js";
 import { handleCommand } from "./commands.js";
 import { chunkText } from "./chunker.js";
 import { resolveApproval, getApprovalUserId } from "../../pipeline/approval.js";
+import type { SecurityManager } from "../../core/security.js";
 
 export class TelegramChannel implements IChannel {
   readonly id = "telegram";
@@ -14,20 +15,25 @@ export class TelegramChannel implements IChannel {
 
   private bot: Bot;
   private commandDeps: CommandDeps | null = null;
-  private allowedUserIds: Set<string>;
+  private security: SecurityManager;
 
-  constructor(token: string, private throttleMs: number, allowedUserIds: string[] = []) {
+  constructor(token: string, private throttleMs: number, securityManager: SecurityManager) {
     this.bot = new Bot(token);
-    this.allowedUserIds = new Set(allowedUserIds);
+    this.security = securityManager;
 
     // Text messages (including commands)
     this.bot.on("message:text", async (ctx) => {
-      if (!this.isAllowed(ctx.from.id)) {
-        await ctx.reply("⛔ Bạn không được phép sử dụng bot này.");
+      const text = ctx.message.text ?? "";
+      
+      const access = this.security.checkAccess(String(ctx.from.id), text);
+      if (!access.isAllowed) {
+        await ctx.reply(access.message || "⛔ Bot bị khoá.");
         return;
       }
-
-      const text = ctx.message.text ?? "";
+      if (access.isNewlyPaired) {
+        await ctx.reply(access.message || "✅ Ghép nối thành công!");
+        return;
+      }
 
       // Handle commands
       if (text.startsWith("/") && this.commandDeps) {
@@ -57,8 +63,9 @@ export class TelegramChannel implements IChannel {
 
     // Photo messages — send image to Claude
     this.bot.on("message:photo", async (ctx) => {
-      if (!this.isAllowed(ctx.from.id)) {
-        await ctx.reply("⛔ Bạn không được phép sử dụng bot này.");
+      const access = this.security.checkAccess(String(ctx.from.id), "");
+      if (!access.isAllowed) {
+        await ctx.reply(access.message || "⛔ Bot bị khoá.");
         return;
       }
 
@@ -98,20 +105,23 @@ export class TelegramChannel implements IChannel {
 
     // Voice messages — not supported yet
     this.bot.on("message:voice", async (ctx) => {
-      if (!this.isAllowed(ctx.from.id)) return;
+      const access = this.security.checkAccess(String(ctx.from.id), "");
+      if (!access.isAllowed) return;
       await ctx.reply("🎙 Tin nhắn thoại chưa được hỗ trợ. Vui lòng gửi văn bản.");
     });
 
     // Video messages — not supported
     this.bot.on("message:video", async (ctx) => {
-      if (!this.isAllowed(ctx.from.id)) return;
+      const access = this.security.checkAccess(String(ctx.from.id), "");
+      if (!access.isAllowed) return;
       await ctx.reply("🎥 Video chưa được hỗ trợ. Vui lòng gửi ảnh hoặc văn bản.");
     });
 
     // Callback query — xử lý approval buttons
     this.bot.on("callback_query:data", async (ctx) => {
-      if (!this.isAllowed(ctx.from.id)) {
-        await ctx.answerCallbackQuery({ text: "⛔ Bạn không được phép sử dụng bot này." });
+      const access = this.security.checkAccess(String(ctx.from.id), "");
+      if (!access.isAllowed) {
+        await ctx.answerCallbackQuery({ text: "⛔ Bot bị khoá." });
         return;
       }
 
@@ -150,11 +160,6 @@ export class TelegramChannel implements IChannel {
     this.bot.catch((err) => {
       console.error("[telegram] bot error:", err);
     });
-  }
-
-  private isAllowed(userId: number): boolean {
-    if (this.allowedUserIds.size === 0) return true;
-    return this.allowedUserIds.has(String(userId));
   }
 
   setCommandDeps(deps: CommandDeps) {

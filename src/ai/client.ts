@@ -3,7 +3,7 @@ import type { MessageParam as AnthropicMsgParam } from "@anthropic-ai/sdk/resour
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { AIClient, AIRequest, AIStreamEvent, ToolDefinition } from "./types.js";
+import type { AIClient, AIRequest, AIStreamEvent, ToolDefinition, MessageParam } from "./types.js";
 
 const CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
 const OAUTH_HEADERS = {
@@ -30,35 +30,23 @@ function readOAuthToken(): string | null {
     const raw = fs.readFileSync(CREDENTIALS_PATH, "utf8");
     const data = JSON.parse(raw) as Record<string, { accessToken?: string; expiresAt?: number }>;
 
-    const now = Date.now();
     let bestToken: string | null = null;
     let latestExpiry = 0;
-    let fallbackToken: string | null = null;
-    let fallbackExpiry = 0;
 
     for (const val of Object.values(data)) {
       if (val?.accessToken?.startsWith("sk-ant-oat")) {
+        // Ưu tiên token còn hạn dài nhất
         const expiry = val.expiresAt ?? 0;
-        // Ưu tiên token còn hạn (với buffer 60s)
-        if (expiry === 0 || expiry > now + 60_000) {
-          if (!bestToken || expiry > latestExpiry) {
-            bestToken = val.accessToken;
-            latestExpiry = expiry;
-          }
-        } else {
-          // Giữ làm fallback nếu tất cả token đều hết hạn
-          if (!fallbackToken || expiry > fallbackExpiry) {
-            fallbackToken = val.accessToken;
-            fallbackExpiry = expiry;
-          }
+        if (!bestToken || expiry > latestExpiry) {
+          bestToken = val.accessToken;
+          latestExpiry = expiry;
         }
       }
     }
 
-    const selected = bestToken ?? fallbackToken;
-    _cachedToken = selected;
+    _cachedToken = bestToken;
     _cachedMtime = mtime;
-    return selected;
+    return bestToken;
   } catch {
     return null;
   }
@@ -120,31 +108,17 @@ export class AnthropicClient implements AIClient {
         ]
       : req.userMessage;
 
-    // Build history — thêm cache_control vào message cuối của history để cache prefix hội thoại
-    const historyMsgs: AnthropicMsgParam[] = req.history.map((m, i) => {
-      const isLast = i === req.history.length - 1;
-      if (isLast && typeof m.content === "string" && m.content.length > 0) {
-        return {
-          role: m.role as AnthropicMsgParam["role"],
-          content: [{ type: "text" as const, text: m.content, cache_control: { type: "ephemeral" as const } }],
-        };
-      }
-      return { role: m.role, content: m.content } as AnthropicMsgParam;
-    });
-
     const messages: AnthropicMsgParam[] = [
-      ...historyMsgs,
+      ...req.history.map((m) => ({ role: m.role, content: m.content } as AnthropicMsgParam)),
       { role: "user", content: userContent },
     ];
 
     const system = this.isOAuth
       ? [
           { type: "text" as const, text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text" as const, text: req.systemPrompt, cache_control: { type: "ephemeral" as const } },
+          { type: "text" as const, text: req.systemPrompt },
         ]
-      : [
-          { type: "text" as const, text: req.systemPrompt, cache_control: { type: "ephemeral" as const } },
-        ];
+      : req.systemPrompt;
 
     let fullText = "";
 
@@ -152,28 +126,19 @@ export class AnthropicClient implements AIClient {
       const client = this.getClient();
       const reqOptions = req.signal ? { signal: req.signal } : undefined;
       const anthropicTools = req.toolHandler?.tools.map(toAnthropicTool) ?? [];
+      let currentMessages: AnthropicMsgParam[] = [...messages];
+      const MAX_STEPS = 7;
 
-      const params = {
-        model: req.model,
-        max_tokens: req.maxTokens,
-        system,
-        messages,
-        ...(anthropicTools.length ? { tools: anthropicTools } : {}),
-      } as Parameters<typeof client.messages.stream>[0];
+      for (let step = 0; step < MAX_STEPS; step++) {
+        const params = {
+          model: req.model,
+          max_tokens: req.maxTokens,
+          system,
+          messages: currentMessages,
+          ...(anthropicTools.length ? { tools: anthropicTools } : {}),
+        } as Parameters<typeof client.messages.stream>[0];
 
-      // Agentic loop — hỗ trợ nhiều vòng tool use liên tiếp
-      const MAX_TOOL_ROUNDS = 10;
-      let currentMessages = messages;
-      let round = 0;
-
-      while (round < MAX_TOOL_ROUNDS) {
-        round++;
-        fullText = "";
-
-        const stream = client.messages.stream(
-          { ...params, messages: currentMessages },
-          reqOptions
-        );
+        const stream = client.messages.stream(params, reqOptions);
 
         for await (const event of stream) {
           if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
@@ -184,51 +149,43 @@ export class AnthropicClient implements AIClient {
 
         const finalMsg = await stream.finalMessage();
 
-        const u = finalMsg.usage as any;
-        if (u.cache_read_input_tokens || u.cache_creation_input_tokens) {
-          console.log(`[cache] read=${u.cache_read_input_tokens ?? 0} write=${u.cache_creation_input_tokens ?? 0} normal=${u.input_tokens}`);
-        }
+        if (finalMsg.stop_reason === "tool_use" && req.toolHandler) {
+          const toolResults: Anthropic.ToolResultBlockParam[] = [];
 
-        if (finalMsg.stop_reason !== "tool_use" || !req.toolHandler) {
-          // Không còn tool call — kết thúc
+          for (const block of finalMsg.content) {
+            if (block.type === "tool_use") {
+              const result = await req.toolHandler.execute(block.name, block.input);
+              toolResults.push({
+                type: "tool_result",
+                tool_use_id: block.id,
+                content: result,
+              });
+            }
+          }
+
+          currentMessages.push({ role: "assistant", content: finalMsg.content as AnthropicMsgParam["content"] });
+          currentMessages.push({ role: "user", content: toolResults as AnthropicMsgParam["content"] });
+
+          if (fullText && !fullText.endsWith("\n")) {
+            fullText += "\n";
+          }
+          // Lặp lại vòng lặp step để bot nhận tool result và chém tiếp
+        } else {
+          // Thực sự gõ xong
           break;
         }
+      } // end for loop
 
-        // Thực thi tất cả tool calls trong round này
-        const toolUseBlocks = finalMsg.content.filter((b) => b.type === "tool_use");
-        const toolResults: Anthropic.ToolResultBlockParam[] = await Promise.all(
-          toolUseBlocks.map(async (block) => {
-            const result = await req.toolHandler!.execute(block.name, block.input);
-            return {
-              type: "tool_result" as const,
-              tool_use_id: block.id,
-              content: result,
-            };
-          })
-        );
-
-        // Thêm cache_control vào tool result cuối để cache context đang tích luỹ
-        const cachedToolResults = toolResults.map((r, i) =>
-          i === toolResults.length - 1
-            ? { ...r, cache_control: { type: "ephemeral" as const } }
-            : r
-        );
-
-        // Append assistant + tool results vào conversation rồi tiếp tục
-        currentMessages = [
-          ...currentMessages,
-          { role: "assistant", content: finalMsg.content as AnthropicMsgParam["content"] },
-          { role: "user", content: cachedToolResults as AnthropicMsgParam["content"] },
-        ];
-      }
-
-      yield { type: "done", fullText };
+      yield { 
+        type: "done", 
+        fullText,
+        assistantMessages: currentMessages.slice(messages.length) as MessageParam[]
+      };
     } catch (err) {
       // Auto-refresh: nếu lỗi 401 (token hết hạn), invalidate cache và retry 1 lần
       const isAuthError =
         err instanceof Error &&
-        ((err as any).status === 401 ||
-          err.message.includes("401") ||
+        (err.message.includes("401") ||
           err.message.includes("authentication") ||
           err.message.includes("unauthorized") ||
           err.message.toLowerCase().includes("token"));
