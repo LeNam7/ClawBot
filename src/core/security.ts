@@ -50,9 +50,10 @@ export class SecurityManager {
    * Nếu user nhắn tin chứa mã Pairing Code hợp lệ, họ sẽ được cấp quyền vĩnh viễn.
    */
   public checkAccess(userId: string, incomingText: string): IPairingState {
-    // 1. Nếu hệ thống Open (không có allowed_users và không có pairing code) -> Cho phép hết
+    // 1. Phân quyền cốt lõi (Hard-Block Mode): Nếu ko điền ALLOWED_USER và ko điền PAIRING, CHẶN SẠCH!
     if (config.allowedUserIds.length === 0 && !config.pairingCode) {
-      return { isAllowed: true };
+      if (this.whitelistedUsers.has(userId)) return { isAllowed: true };
+      return { isAllowed: false, message: "⛔ Bot chưa được cấu hình ALLOWED_USER_IDS hoặc PAIRING_CODE. Vui lòng cấu hình trên Server." };
     }
 
     // 2. Nếu đã có trong danh sách

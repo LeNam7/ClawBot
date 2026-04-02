@@ -3,11 +3,12 @@ import type { MessageParam as AnthropicMsgParam } from "@anthropic-ai/sdk/resour
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import type { AIClient, AIRequest, AIStreamEvent, ToolDefinition, MessageParam } from "./types.js";
 
 const CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
 const OAUTH_HEADERS = {
-  "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+  "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,max-tokens-3-5-sonnet-2024-07-15,prompt-caching-2024-07-31",
   "anthropic-dangerous-direct-browser-access": "true",
   "user-agent": "claude-cli/2.1.75",
   "x-app": "cli",
@@ -116,9 +117,11 @@ export class AnthropicClient implements AIClient {
     const system = this.isOAuth
       ? [
           { type: "text" as const, text: "You are Claude Code, Anthropic's official CLI for Claude." },
-          { type: "text" as const, text: req.systemPrompt },
+          { type: "text" as const, text: req.systemPrompt, cache_control: { type: "ephemeral" as const } },
         ]
-      : req.systemPrompt;
+      : [
+          { type: "text" as const, text: req.systemPrompt, cache_control: { type: "ephemeral" as const } }
+        ];
 
     let fullText = "";
 
@@ -126,8 +129,14 @@ export class AnthropicClient implements AIClient {
       const client = this.getClient();
       const reqOptions = req.signal ? { signal: req.signal } : undefined;
       const anthropicTools = req.toolHandler?.tools.map(toAnthropicTool) ?? [];
+      
+      // Gắn cờ Prompt Caching vào tool cuối cùng (Sẽ group toàn bộ system và tools phía trước vào 1 cache block)
+      if (anthropicTools.length > 0) {
+        (anthropicTools[anthropicTools.length - 1] as any).cache_control = { type: "ephemeral" };
+      }
+
       let currentMessages: AnthropicMsgParam[] = [...messages];
-      const MAX_STEPS = 7;
+      const MAX_STEPS = 25;
 
       for (let step = 0; step < MAX_STEPS; step++) {
         const params = {
@@ -137,6 +146,13 @@ export class AnthropicClient implements AIClient {
           messages: currentMessages,
           ...(anthropicTools.length ? { tools: anthropicTools } : {}),
         } as Parameters<typeof client.messages.stream>[0];
+
+        const reqOptions = {
+          headers: { ...OAUTH_HEADERS },
+          ...(req.signal ? { signal: req.signal } : {}),
+        };
+
+        console.log(`[ai/client] step ${step} maxTokens param sent:`, params.max_tokens);
 
         const stream = client.messages.stream(params, reqOptions);
 
@@ -148,6 +164,7 @@ export class AnthropicClient implements AIClient {
         }
 
         const finalMsg = await stream.finalMessage();
+        console.log(`[ai/client] step ${step} stop_reason:`, finalMsg.stop_reason);
 
         if (finalMsg.stop_reason === "tool_use" && req.toolHandler) {
           const toolResults: Anthropic.ToolResultBlockParam[] = [];
@@ -192,6 +209,15 @@ export class AnthropicClient implements AIClient {
 
       if (isAuthError && this.isOAuth && !req._retried) {
         console.warn("[ai/client] OAuth token expired, invalidating cache and retrying...");
+        
+        // Auto trigger Claude Code CLI ngầm để nó tự refresh token
+        try {
+          const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
+          execSync(`${cmd} -y @anthropic-ai/claude-code -p "K"`, { stdio: "ignore" });
+        } catch (e) {
+          console.error("[ai/client] Failed to trigger claude-code refresh", e);
+        }
+
         invalidateTokenCache();
         yield* this.stream({ ...req, _retried: true });
         return;

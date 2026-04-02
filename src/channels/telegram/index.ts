@@ -23,7 +23,16 @@ export class TelegramChannel implements IChannel {
 
     // Text messages (including commands)
     this.bot.on("message:text", async (ctx) => {
-      const text = ctx.message.text ?? "";
+      let text = ctx.message.text ?? "";
+      
+      const replyMsg = ctx.message.reply_to_message;
+      if (replyMsg) {
+        // @ts-ignore - grammy types sometimes don't expose text/caption dynamically
+        const repliedText = replyMsg.text || replyMsg.caption;
+        if (repliedText) {
+          text = `_[Người dùng đang reply lại tin nhắn: "${repliedText}"]_\n\n${text}`;
+        }
+      }
       
       const access = this.security.checkAccess(String(ctx.from.id), text);
       if (!access.isAllowed) {
@@ -31,6 +40,8 @@ export class TelegramChannel implements IChannel {
         return;
       }
       if (access.isNewlyPaired) {
+        // Tự động xóa tin nhắn chứa PIN của User để bảo mật
+        await ctx.deleteMessage().catch(() => {});
         await ctx.reply(access.message || "✅ Ghép nối thành công!");
         return;
       }

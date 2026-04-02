@@ -19,6 +19,22 @@ export async function fetchUrl(url: string): Promise<string> {
     return `Error: Only http/https URLs are supported.`;
   }
 
+  // SSRF Protection: Ngăn fetch dữ liệu từ mạng nội bộ hoặc hệ thống ảo hóa AWS/Docker
+  const host = parsed.hostname.toLowerCase();
+  const isPrivateIp = 
+    host === "localhost" || 
+    host === "127.0.0.1" || 
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.startsWith("192.168.") || 
+    host.startsWith("10.") || 
+    host.startsWith("169.254.") || 
+    host.match(/^172\.(1[6-9]|2[0-9]|3[0-1])\./);
+
+  if (isPrivateIp) {
+    return `Error: Bảo mật chặn AI truy xuất mạng nội bộ (SSRF Protection). URL: ${parsed.hostname} bị từ chối.`;
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 

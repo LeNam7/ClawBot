@@ -235,3 +235,118 @@ export function listDir(workspaceDir: string, dirPath: string = "."): string {
     return `Lỗi đọc thư mục: ${err instanceof Error ? err.message : String(err)}`;
   }
 }
+
+/**
+ * Sửa điểm nội dung file (Surgical Edit) bằng cách tìm kiếm chính xác đoạn text và thay thế.
+ */
+export function replaceInFile(workspaceDir: string, filePath: string, targetContent: string, replacementContent: string): string {
+  let resolved: string;
+  try {
+    resolved = safePath(workspaceDir, filePath);
+  } catch (e) {
+    return String(e instanceof Error ? e.message : e);
+  }
+
+  if (!fs.existsSync(resolved)) {
+    return `File không tồn tại: ${filePath}`;
+  }
+
+  try {
+    const text = fs.readFileSync(resolved, "utf8");
+    if (!text.includes(targetContent)) {
+      return `Lỗi: Không tìm thấy đoạn text mẫu (target_content) bên trong file. Hãy chắc chắn bạn đã copy chính xác từng khoảng trắng và ký tự xuống dòng của đoạn code cần sửa.`;
+    }
+
+    // Cảnh báo nếu đoạn text xuất hiện nhiều lần (chỉ thay thế lần đầu hoặc bắt AI cung cấp thêm context)
+    const count = text.split(targetContent).length - 1;
+    if (count > 1) {
+      return `Lỗi: Đoạn text (target_content) xuất hiện ${count} lần trong file. Hãy copy nhiều dòng code hơn (mở rộng lên xuống khoảng 3-5 dòng) để đảm bảo đoạn text bạn muốn sửa là DUY NHẤT.`;
+    }
+
+    const newText = text.replace(targetContent, replacementContent);
+    fs.writeFileSync(resolved, newText, "utf8");
+    
+    // Ghi nhận dòng bị thay đổi
+    const linesChanged = replacementContent.split("\n").length - targetContent.split("\n").length;
+    return `✅ Đã sửa file ${filePath} thành công (thay thế ${targetContent.length} ký tự thành ${replacementContent.length} ký tự, chênh lệch ${linesChanged} dòng).`;
+  } catch (err) {
+    return `Lỗi sửa file: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * Thêm nội dung vào cuối file (chỉ dành cho file text/markdown).
+ * Rất hữu ích cho tác vụ AI chunking.
+ */
+export function appendToFile(workspaceDir: string, filePath: string, content: string): string {
+  let resolved: string;
+  try {
+    resolved = safePath(workspaceDir, filePath);
+  } catch (e) {
+    return String(e instanceof Error ? e.message : e);
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    
+    // Tự động xuống dòng nếu file đã tồn tại và nội dung mới không bắt đầu bằng dòng mới
+    let dataToAppend = content;
+    if (fs.existsSync(resolved)) {
+       const stat = fs.statSync(resolved);
+       if (stat.size > 0 && !dataToAppend.startsWith("\n")) {
+         dataToAppend = "\n\n" + dataToAppend;
+       }
+    }
+    
+    fs.appendFileSync(resolved, dataToAppend, "utf8");
+    return `✅ Đã append ${content.length} ký tự vào file ${filePath} thành công.`;
+  } catch (err) {
+    return `Lỗi append file: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * Đọc nội dung file text/markdown (source) và biên dịch ra file đích (target) 
+ * dưới các định dạng như .docx, .pdf, v.v.
+ */
+export async function compileFile(workspaceDir: string, sourcePath: string, targetPath: string): Promise<string> {
+  let sourceResolved: string;
+  let targetResolved: string;
+  try {
+    sourceResolved = safePath(workspaceDir, sourcePath);
+    targetResolved = safePath(workspaceDir, targetPath);
+  } catch (e) {
+    return String(e instanceof Error ? e.message : e);
+  }
+
+  if (!fs.existsSync(sourceResolved)) {
+    return `Lỗi compile: File nguồn "${sourcePath}" không tồn tại.`;
+  }
+  
+  try {
+    const content = fs.readFileSync(sourceResolved, "utf8");
+    fs.mkdirSync(path.dirname(targetResolved), { recursive: true });
+    
+    const ext = path.extname(targetPath).toLowerCase();
+    
+    if (ext === ".docx") {
+      await writeDocx(targetResolved, content);
+      return `✅ Compilation thành công! Đã bọc file markdown sang file Word: ${targetPath}`;
+    }
+    
+    if (ext === ".xlsx" || ext === ".xls") {
+      await writeXlsx(targetResolved, content);
+      return `✅ Compilation thành công! Đã chuyển đổi dữ liệu sang file Excel: ${targetPath}`;
+    }
+    
+    if (ext === ".pdf") {
+      await writePdf(targetResolved, content);
+      return `✅ Compilation thành công! Đã build file PDF: ${targetPath}`;
+    }
+    
+    return `Lỗi compile: Không hỗ trợ định dạng đích "${ext}". Vui lòng dùng .docx, .xlsx hoặc .pdf.`;
+  } catch (err) {
+    return `Lỗi biên dịch file: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+

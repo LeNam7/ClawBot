@@ -11,6 +11,7 @@ import type { HandlerDeps } from "./pipeline/handler.js";
 import { createServer } from "./gateway/server.js";
 import { CronManager } from "./plugins/cron.js";
 import { SecurityManager } from "./core/security.js";
+import { BrowserManager } from "./plugins/browser.js";
 import path from "node:path";
 
 async function main() {
@@ -50,12 +51,15 @@ async function main() {
   const cli = new CLIChannel(securityManager);
   registry.register(cli);
 
+  const browserManager = new BrowserManager(config.workspaceDir);
+
   // 5. Pipeline deps
   const deps: HandlerDeps = {
     sessionManager,
     aiClient,
     channelRegistry: registry,
     config,
+    browserManager,
   };
   
   // Gắn event onMessage chung cho tất cả channel
@@ -92,6 +96,7 @@ async function main() {
       aiClient,
       channelRegistry: registry,
       cronManager,
+      browserManager,
     });
   }
 
@@ -106,8 +111,10 @@ async function main() {
   console.log(`[clawbot] max context: ${config.maxContextTokens} tokens`);
   if (config.allowedUserIds.length > 0) {
     console.log(`[clawbot] allowlist: ${config.allowedUserIds.join(", ")}`);
+  } else if (config.pairingCode) {
+    console.log("[clawbot] allowlist: locked (pairing pin active)");
   } else {
-    console.log("[clawbot] allowlist: open (all users)");
+    console.log("[clawbot] allowlist: LOCKED HARD (unconfigured)");
   }
   console.log("[clawbot] ready ✓");
 
@@ -115,6 +122,8 @@ async function main() {
   const shutdown = async () => {
     console.log("\n[clawbot] shutting down...");
     cronManager.stopAll();
+    
+    try { await browserManager.close(); } catch {}
     
     for (const channel of registry.getAll()) {
       await channel.stop();

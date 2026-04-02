@@ -11,13 +11,16 @@ import { getWeather } from "../plugins/skills/weather.js";
 import { getDatetime } from "../plugins/skills/datetime.js";
 import { calculate } from "../plugins/skills/calc.js";
 import { fetchUrl } from "../plugins/fetch.js";
-import { webSearch } from "../plugins/search.js";
+import { webSearch, executeGlob, executeGrep } from "../plugins/search.js";
 import { searchMemory } from "../memory/search.js";
-import { generateImage } from "../plugins/image.js";
+import { hookRegistry, initHooks } from "../hooks/index.js";
 import { readFile, writeFile, listDir } from "../plugins/fileio.js";
 import path from "node:path";
 import fs from "node:fs";
 import { classifyComplexity, selectModel } from "../ai/router.js";
+import type { BrowserManager } from "../plugins/browser.js";
+
+initHooks();
 
 // ─── Dangerous command patterns (requires approval in "smart" mode) ───────────
 const DANGEROUS_PATTERNS = [
@@ -71,6 +74,29 @@ const TOOLS: ToolDefinition[] = [
         },
       },
       required: ["cron_expression", "message"],
+    },
+  },
+  {
+    name: "list_reminders",
+    description: "List all active reminders and scheduled jobs for the current user/chat. Use when the user asks what tasks or reminders are currently scheduled.",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "delete_reminder",
+    description: "Delete a specific reminder by its ID. Use when the user asks to cancel or remove a scheduled reminder.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: {
+          type: "string",
+          description: "The ID of the reminder to delete (usually the last 6 characters or full ID).",
+        },
+      },
+      required: ["id"],
     },
   },
   {
@@ -182,27 +208,6 @@ const TOOLS: ToolDefinition[] = [
     },
   },
   {
-    name: "generate_image",
-    description:
-      "Tạo ảnh từ mô tả bằng Stable Diffusion XL. Dùng khi người dùng yêu cầu vẽ, tạo ảnh, hoặc minh họa. " +
-      "Mô tả prompt bằng tiếng Anh chi tiết sẽ cho kết quả tốt hơn.",
-    input_schema: {
-      type: "object",
-      properties: {
-        prompt: {
-          type: "string",
-          description: "Mô tả ảnh muốn tạo. Có thể là tiếng Việt hoặc tiếng Anh.",
-        },
-        size: {
-          type: "string",
-          description: "Kích thước ảnh: '1024x1024' (vuông, mặc định), '1792x1024' (ngang), '1024x1792' (dọc)",
-          enum: ["1024x1024", "1792x1024", "1024x1792"],
-        },
-      },
-      required: ["prompt"],
-    },
-  },
-  {
     name: "read_file",
     description:
       "Đọc nội dung file trong workspace. Dùng khi cần xem code hiện tại, đọc config, hoặc review file.",
@@ -238,7 +243,84 @@ const TOOLS: ToolDefinition[] = [
           description: "Nội dung file. Với .docx/.pdf dùng markdown (#, ##, ###). Với .xlsx dùng CSV hoặc JSON array.",
         },
       },
+    required: ["path", "content"],
+    },
+  },
+  {
+    name: "glob_search",
+    description:
+      "Liệt kê tất cả các file khớp với mẫu (wildcard pattern) trong thư mục gốc. " +
+      "Dùng khi bạn muốn lấy danh sách tất cả các file có đuôi nhất định, ví dụ: 'src/**/*.ts' để lấy hết code TS.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pattern: {
+          type: "string",
+          description: "Mẫu tìm kiếm (Glob pattern), ví dụ: 'src/**/*.ts', '*.md'",
+        },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
+    name: "grep_search",
+    description:
+      "Sử dụng công cụ RipGrep Native để tìm kiếm text chính xác hoặc RegEx trong hàng loạt các file với tốc độ siêu nhanh. " +
+      "Sử dụng công cụ này thay vì dùng run_bash với grep nếu bạn muốn rà soát code trên hệ thống.",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Từ khóa hoặc đoạn text cần tìm (Regex cũng được).",
+        },
+        dir: {
+          type: "string",
+          description: "Thư mục để khoanh vùng quét (Tương đối so với workspace), ví dụ: 'src'. Mặc định quét tất cả '.'",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "replace_in_file",
+    description:
+      "Sửa điểm (Surgical edit) nội dung trên một file bằng cách tìm `target_content` và thay bằng `replacement_content`.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        target_content: { type: "string" },
+        replacement_content: { type: "string" },
+      },
+      required: ["path", "target_content", "replacement_content"],
+    },
+  },
+  {
+    name: "append_to_file",
+    description:
+      "Nối thêm nội dung vào cuối tệp tin văn bản (text/markdown/code). Dùng riêng cho Chunking Workflow để viết các văn bản khổng lồ.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Đường dẫn file (VD: nhap.md)" },
+        content: { type: "string", description: "Nội dung cần nối thêm" },
+      },
       required: ["path", "content"],
+    },
+  },
+  {
+    name: "compile_file",
+    description:
+      "Biên dịch file nguồn (như .md, .csv) thành file đích như .docx, .pdf, .xlsx. " +
+      "Dùng riêng trong Chunking Workflow để tổng hợp file cuối cùng giao cho user mà không vi phạm Token Limit.",
+    input_schema: {
+      type: "object",
+      properties: {
+        source_path: { type: "string", description: "File nguồn, VD: bai_luan.md" },
+        target_path: { type: "string", description: "File đích, VD: bai_luan.docx" },
+      },
+      required: ["source_path", "target_path"],
     },
   },
   {
@@ -276,6 +358,29 @@ const TOOLS: ToolDefinition[] = [
       required: [],
     },
   },
+  {
+    name: "browser_action",
+    description: "Điều khiển trình duyệt ảo (Headless). Hỗ trợ điều hướng, click, gõ text, trích xuất text, chụp ảnh và chạy JS. LƯU Ý: Khi gọi screenshot hoặc element_screenshot, ẢNH ĐƯỢC CHỤP SẼ TỰ ĐỘNG GỬI TRỰC TIẾP QUA TELEGRAM CHO USER.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["goto", "click", "type", "scroll", "extract_text", "screenshot", "element_screenshot", "evaluate"],
+          description: "Hành động cần thực thi."
+        },
+        target: {
+          type: "string",
+          description: "URL (dành cho goto), CSS Selector (dành cho click/type), hoặc JS Code (dành cho evaluate)."
+        },
+        value: {
+          type: "string",
+          description: "Text cần gõ (dành cho type) hoặc 'up'/'down' (dành cho scroll)."
+        }
+      },
+      required: ["action"]
+    }
+  }
 ];
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -286,6 +391,7 @@ export interface HandlerDeps {
   channelRegistry: ChannelRegistry;
   config: Config;
   cronManager?: CronManager;
+  browserManager: BrowserManager;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -295,7 +401,7 @@ export async function handleInbound(
   deps: HandlerDeps,
   opts: { noHistory?: boolean } = {}
 ): Promise<void> {
-  const { sessionManager, aiClient, channelRegistry, config, cronManager } = deps;
+  const { sessionManager, aiClient, channelRegistry, config, cronManager, browserManager } = deps;
   const channel = channelRegistry.get(msg.channel);
   const memoriesDir = path.join(path.dirname(config.dbPath), "memories");
 
@@ -315,10 +421,14 @@ export async function handleInbound(
   // Register abort controller
   const controller = registerStream(msg.chatId);
 
-  // Helper: gửi progress update liên tục — user biết clawbot đang làm gì
-  const sendProgress = async (text: string) => {
+  // Helper: Gửi duy nhất 1 tin nhắn biểu tượng đồng hồ cát để báo hiệu đang xử lý
+  let progressMsgId: string | undefined;
+  const sendProgress = async (text?: string) => {
     try {
-      await channel.send({ channel: msg.channel, chatId: msg.chatId, text, isFinal: true });
+      if (!progressMsgId) {
+        progressMsgId = await channel.send({ channel: msg.channel, chatId: msg.chatId, text: `⏳ Đang xử lý...`, isFinal: false });
+      }
+      // Không update text nữa theo yêu cầu của user, chỉ hiện đồng hồ cát cho đến khi có kết quả
     } catch { /* ignore */ }
   };
 
@@ -327,6 +437,19 @@ export async function handleInbound(
     tools: TOOLS,
     execute: async (name, input): Promise<string> => {
       const i = input as Record<string, string>;
+
+      const hookCtx = {
+        chatId: msg.chatId,
+        userId: msg.userId,
+        channel: msg.channel,
+        deps,
+        historySize: history.length,
+      };
+      
+      const hookRes = await hookRegistry.runPreToolUse(hookCtx, name, i);
+      if (!hookRes.allowed) {
+        return hookRes.reason ?? "Execution blocked by hook.";
+      }
 
       switch (name) {
         case "create_reminder": {
@@ -337,6 +460,28 @@ export async function handleInbound(
             return `Reminder created. ID: ${job.id.slice(-6)}. Schedule: "${i.cron_expression}". Message: "${i.message}"`;
           }
           return `Failed to create reminder. Invalid cron expression: "${i.cron_expression}"`;
+        }
+
+        case "list_reminders": {
+          if (!cronManager) return "Reminder feature is not available.";
+          await sendProgress(`Đang lấy danh sách công việc...`);
+          const jobs = cronManager.list(msg.chatId);
+          if (jobs.length === 0) return "No active reminders found for this chat.";
+          return "Active reminders:\n" + jobs.map((j) => `- ID: ${j.id.slice(-6)} | Cron: ${j.expression} | Msg: ${j.prompt}`).join("\n");
+        }
+
+        case "delete_reminder": {
+          if (!cronManager) return "Reminder feature is not available.";
+          const id = i.id ?? "";
+          if (!id) return "Error: Missing reminder ID.";
+          await sendProgress(`Đang xóa công việc ID ${id}...`);
+          
+          const jobs = cronManager.list(msg.chatId);
+          const target = jobs.find((j) => j.id === id || j.id.endsWith(id));
+          if (!target) return `Error: Reminder ID "${id}" not found.`;
+          
+          const success = cronManager.delete(msg.chatId, target.id);
+          return success ? `Reminder ${target.id.slice(-6)} deleted successfully.` : `Failed to delete reminder ${id}.`;
         }
 
         case "get_weather":
@@ -352,28 +497,7 @@ export async function handleInbound(
 
         case "run_bash": {
           const command = i.command ?? "";
-          const needsApproval = shouldRequireApproval(command, config.bashApprovalMode);
-          if (!needsApproval) await sendProgress(`Đang chạy: \`${command.slice(0, 80)}\``);
-
-          if (needsApproval) {
-            if (!channel.sendApprovalMessage) {
-              // Channel không hỗ trợ approval — từ chối để an toàn
-              return `Execution blocked: command requires approval but channel does not support it.\nCommand: ${command}`;
-            }
-
-            const { approvalId, promise } = createApproval(msg.chatId, msg.userId);
-            await channel.sendApprovalMessage(msg.chatId, approvalId, command);
-
-            const result = await promise;
-            if (result === "approved") {
-              return await runBash(command, config.bashTimeoutMs, config.workspaceDir);
-            } else if (result === "rejected") {
-              return `Execution rejected by user: ${command}`;
-            } else {
-              return `Execution timed out waiting for approval: ${command}`;
-            }
-          }
-
+          await sendProgress(`Đang chạy: \`${command.slice(0, 80)}\``);
           return await runBash(command, config.bashTimeoutMs, config.workspaceDir);
         }
 
@@ -385,22 +509,19 @@ export async function handleInbound(
           await sendProgress(`Đang tìm kiếm: "${i.query ?? ""}"`);
           return await webSearch(i.query ?? "");
 
+        case "glob_search": {
+          const { executeGlob } = await import("../plugins/search.js");
+          return await executeGlob(config.workspaceDir, i.pattern as string);
+        }
+
+        case "grep_search": {
+          const { executeGrep } = await import("../plugins/search.js");
+          return await executeGrep(config.workspaceDir, i.query as string, i.dir || ".");
+        }
+
         case "memory_search":
           await sendProgress(`Đang tìm trong memory: "${i.query ?? ""}"`);
           return await searchMemory(i.query ?? "", memoriesDir);
-
-        case "generate_image": {
-          const prompt = i.prompt ?? "";
-          const size = (i.size as "1024x1024" | "1792x1024" | "1024x1792") ?? "1024x1024";
-          await sendProgress(`Đang tạo ảnh: "${prompt.slice(0, 60)}"...`);
-          try {
-            const result = await generateImage(prompt, config.imageApiKey, size);
-            await channel.sendPhoto?.(msg.chatId, result.buffer, undefined);
-            return "Đã tạo và gửi ảnh thành công.";
-          } catch (err) {
-            return `Lỗi tạo ảnh: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        }
 
         case "read_file":
           await sendProgress(`Đang đọc file: ${i.path ?? ""}`);
@@ -424,6 +545,44 @@ export async function handleInbound(
           return result;
         }
 
+        case "replace_in_file": {
+          const filePath = i.path ?? "";
+          const target = i.target_content ?? "";
+          const replacement = i.replacement_content ?? "";
+          await sendProgress(`Đang sửa đổi file: ${filePath}`);
+          const { replaceInFile } = await import("../plugins/fileio.js");
+          return replaceInFile(config.workspaceDir, filePath, target, replacement);
+        }
+
+        case "append_to_file": {
+          const filePath = i.path ?? "";
+          const content = i.content ?? "";
+          await sendProgress(`Đang viết tiếp vào file: ${filePath}`);
+          const { appendToFile } = await import("../plugins/fileio.js");
+          return appendToFile(config.workspaceDir, filePath, content);
+        }
+
+        case "compile_file": {
+          const sourcePath = i.source_path ?? "";
+          const targetPath = i.target_path ?? "";
+          await sendProgress(`Đang biên dịch ${sourcePath} -> ${targetPath}...`);
+          const { compileFile } = await import("../plugins/fileio.js");
+          const result = await compileFile(config.workspaceDir, sourcePath, targetPath);
+          
+          if (result.startsWith("✅") && channel.sendFileBuffer) {
+            try {
+              const fs = await import("node:fs");
+              const resolvedTarget = path.resolve(config.workspaceDir, targetPath);
+              const fileBuffer = fs.readFileSync(resolvedTarget);
+              const filename = path.basename(targetPath);
+              await channel.sendFileBuffer(msg.chatId, fileBuffer, filename);
+            } catch {
+              // Ignore sending errors
+            }
+          }
+          return result;
+        }
+
         case "list_dir":
           await sendProgress(`Đang xem thư mục: ${i.path ?? "."}`);
           return listDir(config.workspaceDir, i.path ?? ".");
@@ -440,6 +599,22 @@ export async function handleInbound(
         case "reset_session":
           sessionManager.reset(sessionKey);
           return "Chat history cleared.";
+
+        case "browser_action": {
+          const action = i.action ?? "";
+          const target = i.target ?? undefined;
+          const value = i.value ?? undefined;
+          
+          await sendProgress(`Đang điều khiển trình duyệt: ${action} ${target || ''}`.trim());
+          const result = await browserManager.executeAction(action, target, value);
+          
+          if (Buffer.isBuffer(result)) {
+            // Nếu là ảnh chụp màn hình
+            await channel.sendPhoto?.(msg.chatId, result, undefined);
+            return "Đã chụp ảnh màn hình và gửi thành công.";
+          }
+          return result;
+        }
 
         default:
           return `Unknown tool: ${name}`;
@@ -464,29 +639,20 @@ export async function handleInbound(
   const userContent = safeReadTrimmed(path.join(dataDir, "user.md"), 800);
   const memoryContent = safeReadTrimmed(path.join(dataDir, "memory.md"), 1200);
 
-  // ─── Build dynamic system prompt với context thời gian thực ────────────────
-  const now = new Date();
-  const vnTime = now.toLocaleString("vi-VN", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-  const hour = parseInt(now.toLocaleString("en-US", { timeZone: "Asia/Ho_Chi_Minh", hour: "numeric", hour12: false }));
-  const greeting =
-    hour >= 5 && hour < 11 ? "buổi sáng" :
-    hour >= 11 && hour < 14 ? "buổi trưa" :
-    hour >= 14 && hour < 18 ? "buổi chiều" :
-    hour >= 18 && hour < 22 ? "buổi tối" : "đêm khuya";
-
-  const dynamicContext = `\n\n---\n[CONTEXT THỜI GIAN THỰC]\nGiờ hiện tại: ${vnTime} (${greeting})\nKhi chào hỏi, dùng đúng thời điểm "${greeting}" — KHÔNG dùng lời chào sai giờ (ví dụ không nói "ngủ ngon" hay "chào buổi sáng" sai thời điểm).`;
-
   const soulBlock = soulContent ? `\n\n---\n${soulContent}` : "";
   const userBlock = userContent ? `\n\n---\n${userContent}` : "";
   const memoryBlock = memoryContent ? `\n\n---\n[MEMORY - ĐỌC TRƯỚC KHI TRẢ LỜI]\n${memoryContent}` : "";
+
+  // Thay thế hardcoded dynamicContext bằng luồng SessionStart Hooks
+  const hookCtx = {
+    chatId: msg.chatId,
+    userId: msg.userId,
+    channel: msg.channel,
+    deps,
+    historySize: history.length,
+  };
+  const dynamicContextText = await hookRegistry.runSessionStart(hookCtx);
+  const dynamicContext = dynamicContextText ? `\n\n${dynamicContextText}` : "";
 
   // ─── Model routing — tự chọn model theo độ phức tạp ─────────────────────
   const complexity = classifyComplexity(msg.text, history);
@@ -586,6 +752,9 @@ export async function handleInbound(
     }
   } finally {
     deregisterStream(msg.chatId);
+    if (progressMsgId && channel.id === "telegram") {
+      try { await (channel as any).bot.api.deleteMessage(msg.chatId, Number(progressMsgId)); } catch {}
+    }
   }
 
   if (!opts.noHistory) {

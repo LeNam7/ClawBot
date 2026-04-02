@@ -1,4 +1,8 @@
 // web_search tool — tìm kiếm web qua DuckDuckGo (không cần API key)
+import fs from "node:fs";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import glob from "fast-glob";
 
 const SEARCH_TIMEOUT_MS = 10_000;
 const MAX_RESULTS = 5;
@@ -98,4 +102,80 @@ function parseDDGResults(html: string): SearchResult[] {
 
 function stripTags(s: string): string {
   return s.replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&nbsp;/g, " ");
+}
+
+// --- NATIVE FILE SEARCH ENGINES (Glob & RipGrep) ---
+
+let rgPath = "";
+const MAX_GREP_OUTPUT_LENGTH = 10000;
+
+export async function executeGlob(workspaceDir: string, pattern: string): Promise<string> {
+  // Ngăn chặn Traversal: cấm dấu ../ hoặc ..\
+  if (pattern.includes("../") || pattern.includes("..\\")) {
+    return "Lỗi bảo mật: Truy vấn Glob không được chứa ký tự Traversal (..) để thoát khỏi Workspace.";
+  }
+
+  const workspace = path.resolve(workspaceDir);
+  try {
+    const entries = await glob(pattern, {
+      cwd: workspace,
+      dot: true,
+      ignore: ["**/node_modules/**", "**/.git/**"]
+    });
+    
+    if (entries.length === 0) {
+      return `Không tìm thấy file nào khớp với mẫu: ${pattern}`;
+    }
+    
+    return `Tìm thấy ${entries.length} file:\n` + entries.slice(0, 50).map(e => `- ${e}`).join("\n") + (entries.length > 50 ? "\n... (đã ẩn bớt kết quả dài)" : "");
+  } catch (err) {
+    return `Lỗi quét quy tắc thư mục: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+export async function executeGrep(workspaceDir: string, query: string, dir: string = "."): Promise<string> {
+  if (!rgPath) {
+    try {
+      const pkg = await import("@vscode/ripgrep");
+      rgPath = pkg.rgPath;
+    } catch {
+      return "Lỗi: Không tìm thấy module @vscode/ripgrep. Codebase chưa được cài đặt đúng cách.";
+    }
+  }
+
+  const workspace = path.resolve(workspaceDir);
+  const targetDir = path.resolve(workspace, dir);
+  
+  if (!targetDir.startsWith(workspace + path.sep) && targetDir !== workspace) {
+    return "Lỗi bảo mật: Thư mục tìm kiếm nằm ngoài Sandbox Workspace.";
+  }
+
+  return new Promise((resolve) => {
+    // ripgrep arguments: -n (line number), -i (ignore case), explicitly exclude node_modules and .git
+    const args = ["-n", "-i", "--glob", "!node_modules/**", "--glob", "!.git/**", query, "."];
+
+    execFile(rgPath, args, { cwd: targetDir, maxBuffer: 1024 * 1024 * 5 }, (error, stdout, stderr) => {
+      // Exit code 1 means no lines were selected, 2 means error
+      if (error && error.code !== 1) {
+        if (error.code === 1) {
+          resolve("Không tìm thấy kết quả nào.");
+        } else {
+          resolve(`Lỗi chạy ripgrep: ${stderr || error.message}`);
+        }
+        return;
+      }
+
+      if (!stdout) {
+        resolve("Không tìm thấy kết quả nào.");
+        return;
+      }
+
+      // Safeguard against massive spillage Output 
+      let finalOutput = stdout;
+      if (stdout.length > MAX_GREP_OUTPUT_LENGTH) {
+        finalOutput = stdout.slice(0, MAX_GREP_OUTPUT_LENGTH) + `\n\n... [Đã cắt bớt vì kết quả quá lớn (${stdout.length} chars). Khuyên dùng lệnh tìm hẹp hơn]`;
+      }
+      resolve(`[Tìm kiếm: "${query}" tại ${dir}]\n\n${finalOutput}`);
+    });
+  });
 }

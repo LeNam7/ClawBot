@@ -46,11 +46,10 @@ export class SessionManager {
       return sum + JSON.stringify(m.content).length;
     }, 0);
 
-    if (totalChars <= budget) return messages;
-
-    // Xóa từ đầu (cũ nhất) cho đến khi vừa ngân sách, giữ ít nhất 2 turns cuối
-    const result = [...messages];
     let removedCount = 0;
+    const result = [...messages];
+    
+    // 1. Cắt cho đến khi vừa ngân sách (chừa lại block cuối)
     while (result.length > 2 && totalChars > budget) {
       const removed = result.shift()!;
       const removedContentLength = typeof removed.content === "string" 
@@ -60,23 +59,40 @@ export class SessionManager {
       removedCount++;
     }
 
+    // 2. Bảo toàn tính toàn vẹn của Anthropic API (Không được mồ côi tool_result và phải bắt đầu bằng user)
+    // Luôn chạy bước này để chống lại việc store.getTurns() cắt ngẫu nhiên
+    while (result.length > 0) {
+      const first = result[0];
+      let needsShift = false;
+      
+      if (first.role !== "user") {
+        needsShift = true;
+      } else if (Array.isArray(first.content) && first.content.some((c: any) => c.type === "tool_result" || c.type === "tool_use")) {
+        needsShift = true;
+      }
+      
+      if (needsShift) {
+        const removed = result.shift()!;
+        const removedContentLength = typeof removed.content === "string" 
+          ? removed.content.length 
+          : JSON.stringify(removed.content).length;
+        totalChars -= removedContentLength;
+        removedCount++;
+      } else {
+        break; // Tìm thấy điểm bắt đầu hợp lệ
+      }
+    }
+
     // Đánh dấu cho Model biết một phần lịch sử đã bị cắt
     if (removedCount > 0 && result.length > 0) {
-      for (let i = 0; i < result.length; i++) {
-        if (result[i].role === "user") {
-          const prefix = `_[Hệ thống: ${removedCount} đoạn hội thoại cũ nhất đã bị đưa vào lưu trữ (archive) để giảm giới hạn Context Window. Hãy tiếp tục dựa trên ngữ cảnh còn lại.]_\n\n`;
-          if (typeof result[i].content === "string") {
-            result[i].content = prefix + result[i].content;
-          } else if (Array.isArray(result[i].content)) {
-            // Giả định content là mảng các block của Anthropic (có text/tool_result/etc)
-            // Ta chèn block text vào đầu mảng
-            result[i].content = [
-              { type: "text", text: prefix },
-              ...result[i].content
-            ];
-          }
-          break;
-        }
+      const prefix = `_[Hệ thống: ${removedCount} đoạn hội thoại cũ đã bị xóa để tối ưu bộ nhớ.]_\n\n`;
+      if (typeof result[0].content === "string") {
+        result[0].content = prefix + result[0].content;
+      } else if (Array.isArray(result[0].content)) {
+        result[0].content = [
+          { type: "text", text: prefix },
+          ...result[0].content
+        ];
       }
     }
 
