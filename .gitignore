@@ -2,3 +2,6 @@
 data/
 node_modules/
 dist/
+workspace/
+server_log.txt
+$null

@@ -1,4 +1,5 @@
 import type { Bot } from "grammy";
+import { formatForTelegram } from "./formatter.js";
 
 /**
  * TelegramStreamSender — tích lũy toàn bộ response rồi gửi 1 lần duy nhất.
@@ -9,7 +10,7 @@ export class TelegramStreamSender {
   private fullText = "";
   private stopped = false;
   private messageId: number | null = null;
-  private lastSentText = "";
+  private lastSentText: string | null = null;
   private flushInterval: NodeJS.Timeout | null = null;
   private flushPromise: Promise<void> | null = null;
 
@@ -33,18 +34,34 @@ export class TelegramStreamSender {
   private async flush(): Promise<void> {
     if (this.stopped) return;
     const text = this.fullText.trim();
-    if (!text || text === this.lastSentText) return;
+    if (this.lastSentText !== null && text === this.lastSentText) return;
+    // Parse HTML đẹp trong lúc gõ cho thẻ <thought>
+    let safeText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let inThought = false;
+    safeText = safeText.replace(/&lt;thought&gt;/g, () => {
+      inThought = true;
+      return "<blockquote>💭 <i>Quá trình suy nghĩ:</i>\n";
+    });
+    safeText = safeText.replace(/&lt;\/thought&gt;/g, () => {
+      inThought = false;
+      return "</blockquote>\n";
+    });
+    if (inThought) safeText += "</blockquote>";
 
-    // Telegram giới hạn độ dài tin nhắn (4096), cắt đuôi lấy khúc cuối nếu quá lớn để stream
-    let safeText = text;
     if (safeText.length > 4000) {
       safeText = safeText.slice(-4000);
     }
+    
+    // Đảm bảo ko bao giờ gửi text rỗng (fix lỗi 400 Bad Request)
+    if (!safeText.trim()) {
+       safeText = "💭 _Đang đọc tài liệu / Suy nghĩ..._"; 
+    }
+    
     safeText += " ✍️"; // Indicator con bot đang viết
 
     if (!this.messageId) {
       try {
-        const result = await this.bot.api.sendMessage(this.chatId, safeText);
+        const result = await this.bot.api.sendMessage(this.chatId, safeText, { parse_mode: "HTML" });
         this.messageId = result.message_id;
         this.lastSentText = text;
       } catch (e) {
@@ -52,7 +69,7 @@ export class TelegramStreamSender {
       }
     } else {
       try {
-        await this.bot.api.editMessageText(this.chatId, this.messageId, safeText);
+        await this.bot.api.editMessageText(this.chatId, this.messageId, safeText, { parse_mode: "HTML" });
         this.lastSentText = text;
       } catch (e) {
         // Ignore edit errors (often "message is not modified" or rate limit)
@@ -78,6 +95,16 @@ export class TelegramStreamSender {
     if (!finalTxt) return;
 
     const chunks = this.splitMessage(finalTxt);
+    
+    // Nếu kết quả format ra chuỗi rỗng (AI chỉ gọi tool, không sinh ra text thường)
+    // thì xóa luôn cái message "Đang suy nghĩ..." ban nãy
+    if (chunks.length === 0) {
+      if (this.messageId) {
+        try { await this.bot.api.deleteMessage(this.chatId, this.messageId); } catch {}
+      }
+      return;
+    }
+
     let isFirstChunk = true;
 
     for (const chunk of chunks) {
@@ -120,20 +147,21 @@ export class TelegramStreamSender {
   }
 
   private splitMessage(text: string, maxLen = 4096): string[] {
-    if (text.length <= maxLen) return [this.escapeMarkdownV2(text)];
+    const formatted = formatForTelegram(text).trim();
+    if (!formatted) return [];
+
+    if (formatted.length <= maxLen) return [formatted];
+    
     const chunks: string[] = [];
-    let remaining = text;
+    let remaining = formatted;
     while (remaining.length > 0) {
       let cutAt = maxLen;
       const lastNewline = remaining.lastIndexOf("\n", maxLen);
       if (lastNewline > maxLen * 0.6) cutAt = lastNewline + 1;
-      chunks.push(this.escapeMarkdownV2(remaining.slice(0, cutAt).trimEnd()));
+      chunks.push(remaining.slice(0, cutAt).trimEnd());
       remaining = remaining.slice(cutAt).trimStart();
     }
     return chunks;
   }
 
-  private escapeMarkdownV2(text: string): string {
-    return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
-  }
 }

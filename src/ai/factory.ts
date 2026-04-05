@@ -1,5 +1,4 @@
 import type { AIClient } from "./types.js";
-import { AnthropicClient } from "./client.js";
 import { OpenAIClient } from "./openai-client.js";
 import { FallbackClient } from "./fallback.js";
 
@@ -18,13 +17,7 @@ export interface AIProviderConfig {
 export function createAIClient(cfg: AIProviderConfig): AIClient {
   switch (cfg.provider) {
     case "anthropic": {
-      const primary = new AnthropicClient(cfg.anthropicApiKey ?? "auto");
-      // Nếu có sẵn key OpenAI, thiết lập nó làm fallback mặc định (gpt-4o-mini)
-      if (cfg.openaiApiKey) {
-        const fallback = new OpenAIClient(cfg.openaiApiKey, cfg.openaiBaseUrl);
-        return new FallbackClient(primary, [{ client: fallback, defaultModel: "gpt-4o-mini" }]);
-      }
-      return primary;
+      throw new Error("Anthropic has been temporarily disabled. Please use openai provider.");
     }
 
     case "openai":

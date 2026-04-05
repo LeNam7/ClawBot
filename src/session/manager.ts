@@ -30,6 +30,9 @@ export class SessionManager {
     const messages: MessageParam[] = turns.map((t) => ({
       role: t.role as MessageParam["role"],
       content: t.content,
+      tool_calls: t.tool_calls,
+      tool_call_id: t.tool_call_id,
+      name: t.name,
     }));
     return this.pruneByTokens(messages);
   }
@@ -111,6 +114,13 @@ export class SessionManager {
     this.store.appendTurn(key, {
       role: "assistant",
       content,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  appendFullTurn(key: SessionKey, message: MessageParam) {
+    this.store.appendTurn(key, {
+      ...message,
       createdAt: new Date().toISOString(),
     });
   }

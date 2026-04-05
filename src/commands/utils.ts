@@ -24,7 +24,7 @@ export function buildExportMarkdown(
     ``,
   ];
   for (const t of turns) {
-    const role = t.role === "user" ? "👤 User" : "🤖 Claude";
+    const role = t.role === "user" ? "👤 User" : "🤖 Gemma";
     const content = typeof t.content === "string"
       ? t.content
       : JSON.stringify(t.content);
@@ -57,7 +57,7 @@ export async function saveMemory(
     `## Conversation`,
     ...turns.map((t) => {
       const c = typeof t.content === "string" ? t.content : JSON.stringify(t.content);
-      return `**${t.role === "user" ? "User" : "Claude"}:** ${c}`;
+      return `**${t.role === "user" ? "User" : "Gemma"}:** ${c}`;
     }),
   ].join("\n");
 

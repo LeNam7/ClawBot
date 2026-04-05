@@ -1,5 +1,5 @@
 import type { AIClient, AIRequest, AIStreamEvent } from "./types.js";
-import { AnthropicClient } from "./client.js";
+
 
 export class FallbackClient implements AIClient {
   constructor(private primary: AIClient, private fallbacks: { client: AIClient; defaultModel: string }[]) {}

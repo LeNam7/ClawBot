@@ -19,119 +19,175 @@ export class OpenAIClient implements AIClient {
     let fullText = "";
 
     try {
-      const messages = buildMessages(req);
+      let currentMessages = buildMessages(req);
       const tools = req.toolHandler?.tools.map(toOpenAITool) ?? [];
+      const MAX_STEPS = 25;
 
-      const params: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
-        model: req.model,
-        max_tokens: req.maxTokens,
-        messages,
-        stream: true,
-        ...(tools.length ? { tools, tool_choice: "auto" as const } : {}),
-      };
-
-      const stream = await this.client.chat.completions.create(params, {
-        signal: req.signal,
-      });
-
-      // Accumulate tool calls across chunks
-      const toolCallsMap: Record<number, {
-        id: string;
-        name: string;
-        arguments: string;
-      }> = {};
-
-      let finishReason: string | null = null;
-
-      for await (const chunk of stream) {
-        const choice = chunk.choices[0];
-        if (!choice) continue;
-
-        finishReason = choice.finish_reason ?? finishReason;
-        const delta = choice.delta;
-
-        // Stream text
-        if (delta.content) {
-          fullText += delta.content;
-          yield { type: "delta", delta: delta.content, fullText };
-        }
-
-        // Accumulate tool calls
-        if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            if (!toolCallsMap[tc.index]) {
-              toolCallsMap[tc.index] = { id: tc.id ?? "", name: "", arguments: "" };
-            }
-            const entry = toolCallsMap[tc.index];
-            if (tc.id) entry.id = tc.id;
-            if (tc.function?.name) entry.name += tc.function.name;
-            if (tc.function?.arguments) entry.arguments += tc.function.arguments;
-          }
-        }
-      }
-
-      const toolCalls = Object.values(toolCallsMap);
-
-      // Handle tool calls
-      if (finishReason === "tool_calls" && req.toolHandler && toolCalls.length > 0) {
-        const toolResultMsgs: OpenAI.Chat.ChatCompletionToolMessageParam[] = [];
-
-        for (const tc of toolCalls) {
-          let input: unknown;
-          try {
-            input = JSON.parse(tc.arguments || "{}");
-          } catch {
-            input = {};
-          }
-          const result = await req.toolHandler.execute(tc.name, input);
-          toolResultMsgs.push({
-            role: "tool",
-            tool_call_id: tc.id,
-            content: result,
-          });
-        }
-
-        // Build assistant message with tool_calls
-        const assistantToolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[] = toolCalls.map((tc) => ({
-          id: tc.id,
-          type: "function" as const,
-          function: { name: tc.name, arguments: tc.arguments },
-        }));
-
-        const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = {
-          role: "assistant",
-          content: fullText || null,
-          tool_calls: assistantToolCalls,
+      for (let step = 0; step < MAX_STEPS; step++) {
+        const params: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
+          model: req.model,
+          max_tokens: req.maxTokens,
+          messages: currentMessages as OpenAI.Chat.ChatCompletionMessageParam[],
+          stream: true,
+          ...(tools.length ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
         };
 
-        const messages2: OpenAI.Chat.ChatCompletionMessageParam[] = [
-          ...messages,
-          assistantMsg,
-          ...toolResultMsgs,
-        ];
+        const stream = await this.client.chat.completions.create(params, {
+          signal: req.signal,
+        });
 
-        fullText = "";
+        // Accumulate tool calls across chunks
+        const toolCallsMap: Record<number, {
+          id: string;
+          name: string;
+          arguments: string;
+        }> = {};
 
-        const stream2 = await this.client.chat.completions.create(
-          {
-            model: req.model,
-            max_tokens: req.maxTokens,
-            messages: messages2,
-            stream: true,
-          },
-          { signal: req.signal }
-        );
+        let finishReason: string | null = null;
+        let stepText = "";
 
-        for await (const chunk of stream2) {
-          const d = chunk.choices[0]?.delta?.content;
-          if (d) {
-            fullText += d;
-            yield { type: "delta", delta: d, fullText };
+        for await (const chunk of stream) {
+          const choice = chunk.choices[0];
+          if (!choice) continue;
+
+          finishReason = choice.finish_reason ?? finishReason;
+          const delta = choice.delta;
+
+          // Stream text
+          if (delta.content) {
+            stepText += delta.content;
+            fullText += delta.content;
+            yield { type: "delta", delta: delta.content, fullText };
           }
+
+          // Accumulate tool calls
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const actualIndex = tc.index ?? 0;
+              
+              if (!toolCallsMap[actualIndex]) {
+                toolCallsMap[actualIndex] = { id: tc.id || `call_${actualIndex}`, name: "", arguments: "" };
+              }
+
+              let entry = toolCallsMap[actualIndex];
+
+              // WORKAROUND cho thuật toán của Gemini/Ollama: 
+              // Đôi khi hệ thống trả về nhiều tool call riêng biệt nhưng lại xài chung index = 0!
+              // Nếu entry này ĐÃ CÓ arguments, mà giờ lại đẻ thêm tên hàm mới, tức là nó đang gửi 1 hàm mới hoàn toàn.
+              if (tc.function?.name && entry.arguments.length > 0) {
+                 const newIndex = Object.keys(toolCallsMap).length + 100; // Fake một index mới để cách ly
+                 toolCallsMap[newIndex] = { id: tc.id || `call_${newIndex}`, name: "", arguments: "" };
+                 entry = toolCallsMap[newIndex];
+              }
+
+              if (tc.id) entry.id = tc.id;
+              if (tc.function?.name) entry.name += tc.function.name;
+              if (tc.function?.arguments) entry.arguments += tc.function.arguments;
+            }
+          }
+        }
+
+        const toolCalls = Object.values(toolCallsMap);
+
+        // Handle tool calls (Google AI Studio returns "stop" instead of "tool_calls" in finish_reason so we explicitly check array length)
+        console.log(`[step ${step}] fullText size:`, fullText.length, `toolCalls count:`, toolCalls.length);
+
+        if (req.toolHandler && toolCalls.length > 0) {
+          console.log(`[step ${step}] Executing ${toolCalls.length} tools...`);
+          const toolResultMsgs: OpenAI.Chat.ChatCompletionToolMessageParam[] = [];
+
+          for (const tc of toolCalls) {
+            let input: unknown;
+            try {
+              input = JSON.parse(tc.arguments || "{}");
+            } catch {
+              input = {};
+            }
+            console.log(`[step ${step}] EXECUTING TOOL:`, tc.name);
+            const result = await req.toolHandler.execute(tc.name, input);
+            console.log(`[step ${step}] TOOL FINISHED. Result len:`, result.length);
+            toolResultMsgs.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: result,
+            });
+          }
+
+          const assistantToolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[] = toolCalls.map((tc, idx) => {
+            let validArgs = tc.arguments;
+            try {
+              const parsed = JSON.parse(validArgs || "{}");
+              // --- HỆ THỐNG TRIMMING (CONTEXT COMPACTION) ---
+              // Quét để nén các trường nội dung quá dài (>2500 ký tự) xuống còn ~1000 ký tự
+              let isCompressed = false;
+              for (const key in parsed) {
+                if (typeof parsed[key] === "string" && parsed[key].length > 2500) {
+                  const originalLen = parsed[key].length;
+                  parsed[key] = parsed[key].substring(0, 500) + 
+                    `\n\n...[HỆ THỐNG ĐÃ NÉN: Đã cắt giảm ${originalLen - 1000} ký tự. Tool này đã ghi thành công vào ổ đĩa. Trút bỏ text này để chống tràn Context.]...\n\n` + 
+                    parsed[key].slice(-500);
+                  isCompressed = true;
+                }
+              }
+              if (isCompressed) {
+                validArgs = JSON.stringify(parsed);
+                console.log(`[step ${step}] Compaction triggered on ${tc.name}! Argument string minimized.`);
+              }
+            } catch {
+              validArgs = "{}";
+            }
+            return {
+              id: tc.id || `call_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+              type: "function" as const,
+              function: { name: tc.name, arguments: validArgs },
+            };
+          });
+
+          const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = {
+            role: "assistant",
+            content: stepText || "",
+            tool_calls: assistantToolCalls,
+          };
+
+          currentMessages = [
+            ...currentMessages,
+            assistantMsg,
+            ...toolResultMsgs,
+          ];
+          
+          console.log(`[step ${step}] Appended tools. currentMessages.length now:`, currentMessages.length);
+          continue;
+        } else {
+          let visibleText = (stepText || "").replace(/<thought>[\s\S]*?<\/thought>/g, "");
+          visibleText = visibleText.replace(/<thought>[\s\S]*$/g, "").trim(); // Quét luôn cả thẻ mở mà không có đóng ở cuối đoạn
+          
+          console.log(`[step ${step}] No tool calls. visibleText=`, visibleText === "" ? "EMPTY" : visibleText.substring(0,20));
+          if (visibleText === "") {
+             const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = { role: "assistant", content: stepText || "" };
+             const systemNudge: OpenAI.Chat.ChatCompletionUserMessageParam = { 
+               role: "user", 
+               content: "[Hệ thống tự động nhắc nhở]: Bạn vừa phân tích trong thẻ thought nhưng lại QUÊN không gọi bất kỳ tool nào (ví dụ manage_tasks, write_file) hoặc quên trả lời cho tôi. BẮT BUỘC gọi tool ở định dạng JSON để tiến hành bước tiếp theo." 
+             };
+             currentMessages = [...currentMessages, assistantMsg, systemNudge];
+             console.log(`[step ${step}] WATCHDOG TICKED! currentMessages.length now:`, currentMessages.length);
+             continue;
+          }
+          console.log(`[step ${step}] Breaking loop! visibleText is NOT EMPTY or loop ends.`);
+          break;
         }
       }
 
-      yield { type: "done", fullText };
+      const startIndex = req.systemPrompt ? req.history.length + 2 : req.history.length + 1;
+      
+      console.log(`[openai-client debug] Yielding done. currentMessages.length=${currentMessages.length}, startIndex=${startIndex}`);
+      const assistantMessagesToYield = currentMessages.slice(startIndex) as any[];
+      console.log(`[openai-client debug] assistantMessages sliced length=${assistantMessagesToYield.length}`);
+
+      yield { 
+        type: "done", 
+        fullText,
+        assistantMessages: assistantMessagesToYield
+      };
     } catch (err) {
       yield { type: "error", error: err instanceof Error ? err : new Error(String(err)) };
     }
@@ -148,7 +204,13 @@ function buildMessages(req: AIRequest): OpenAI.Chat.ChatCompletionMessageParam[]
   }
 
   for (const h of req.history) {
-    msgs.push({ role: h.role, content: h.content });
+    if (h.role === "assistant") {
+      msgs.push({ role: h.role, content: h.content, tool_calls: h.tool_calls as any });
+    } else if (h.role === "tool") {
+      msgs.push({ role: h.role, content: h.content, tool_call_id: h.tool_call_id as string });
+    } else {
+      msgs.push({ role: h.role as "user", content: h.content });
+    }
   }
 
   if (req.imageBase64) {

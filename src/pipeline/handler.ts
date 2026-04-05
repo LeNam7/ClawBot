@@ -19,6 +19,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { classifyComplexity, selectModel } from "../ai/router.js";
 import type { BrowserManager } from "../plugins/browser.js";
+import { taskManager } from "../plugins/task.js";
 
 initHooks();
 
@@ -378,7 +379,7 @@ const TOOLS: ToolDefinition[] = [
       properties: {
         action: {
           type: "string",
-          enum: ["goto", "click", "type", "scroll", "extract_text", "screenshot", "element_screenshot", "evaluate"],
+          enum: ["goto", "click", "type", "scroll", "extract_text", "screenshot", "element_screenshot", "evaluate", "download", "extract_image", "upload", "extract_gemini_thought"],
           description: "Hành động cần thực thi."
         },
         target: {
@@ -391,6 +392,49 @@ const TOOLS: ToolDefinition[] = [
         }
       },
       required: ["action"]
+    }
+  },
+  {
+    name: "manage_tasks",
+    description: "Quản lý Bảng Checklist trên Telegram. Dùng CREATE để khởi tạo danh sách các công việc sẽ làm. Dùng UPDATE để cập nhật trạng thái khi tiến hành từng bước. LUÔN LUÔN tạo Checklist cho các tác vụ thay đổi mã nguồn phức tạp hơn 2 bước.",
+    input_schema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["create", "update"],
+          description: "Tạo mới hoặc Cập nhật."
+        },
+        tasks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              status: { type: "string", enum: ["pending", "doing", "done", "error"] },
+              error_msg: { type: "string" }
+            },
+            required: ["id", "title", "status"]
+          },
+          description: "Mảng danh sách task. Khi UPDATE chỉ cần truyền những task cần update (cùng ID)."
+        }
+      },
+      required: ["action", "tasks"]
+    }
+  },
+  {
+    name: "generate_image",
+    description: "Vẽ ảnh bằng AI. Ảnh sẽ được tự động vẽ và tự động gửi trực tiếp vào phòng chat Telegram của User luôn. LƯU Ý: AI model vẽ ảnh giao tiếp tốt nhất bằng tiếng Anh, nên bạn luôn luôn phải DỊCH Prompt sang tiếng Anh, có thể phóng tác thêm các chi tiết nghệ thuật (lighting, style, 8k resolution, cinematic) để hình ảnh sinh ra rực rỡ và đẹp mắt nhất có thể.",
+    input_schema: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "Mô tả chi tiết bức ảnh mong muốn (BẰNG TIẾNG ANH)."
+        }
+      },
+      required: ["prompt"]
     }
   }
 ];
@@ -426,9 +470,13 @@ export async function handleInbound(
   const sessionKey = sessionManager.getOrCreate(msg.channel, msg.userId, msg.chatId);
   const history = opts.noHistory ? [] : sessionManager.getHistory(sessionKey);
 
-  if (!opts.noHistory) {
-    sessionManager.appendUserTurn(sessionKey, msg.text);
+  // Inject system note for Img2Img uploaded files
+  const uploadedImagePath = typeof raw?.uploadedImagePath === "string" ? raw.uploadedImagePath : undefined;
+  if (uploadedImagePath) {
+    msg.text += `\n\n_[HỆ THỐNG: User có đính kèm một file ảnh. Kênh Telegram đã lưu ảnh này vào ổ cứng Server tại đường dẫn tuyệt đối: ${uploadedImagePath}. Nếu bạn muốn đưa hình ảnh này vào trang web Gemini để phân tích hoặc chỉnh sửa (img2img/analyze), hãy dùng tool browser_action gọi lệnh \`upload\` nhắm vào nút <input type="file"> và truyền \`value\` là đường dẫn \`${uploadedImagePath}\` này nhé.]_`;
   }
+
+  // We don't save the user turn here anymore to avoid duplicate context, it will be saved at the end if the request succeeds.
 
   // Register abort controller
   const controller = registerStream(msg.chatId);
@@ -556,15 +604,32 @@ export async function handleInbound(
           const filePath = i.path ?? "";
           await sendProgress(`Đang tạo file: ${filePath}`);
           const result = await writeFile(config.workspaceDir, filePath, i.content ?? "");
-          // Nếu ghi thành công, gửi file thật cho user
-          if (result.startsWith("✅") && channel.sendFileBuffer) {
-            try {
-              const resolvedPath = path.resolve(config.workspaceDir, filePath);
-              const fileBuffer = (await import("node:fs")).readFileSync(resolvedPath);
-              const filename = path.basename(filePath);
-              await channel.sendFileBuffer(msg.chatId, fileBuffer, filename);
-            } catch {
-              // Không thể đọc file để gửi — vẫn trả về text bình thường
+          if (result.startsWith("✅")) {
+            if (channel.sendFileBuffer) {
+              try {
+                const resolvedPath = path.resolve(config.workspaceDir, filePath);
+                const fileBuffer = (await import("node:fs")).readFileSync(resolvedPath);
+                const filename = path.basename(filePath);
+                await channel.sendFileBuffer(msg.chatId, fileBuffer, filename);
+              } catch { }
+            }
+            // KIỂM DUYỆT TRỌNG TÀI (Chỉ áp dụng cho source code, không áp dụng cho văn bản)
+            const ext = path.extname(filePath).toLowerCase();
+            const isCodeFile = [".ts", ".js", ".py", ".go", ".java", ".cpp", ".c", ".rs", ".php"].includes(ext);
+            
+            if (isCodeFile) {
+              try {
+                 const { CodeVerifier } = await import("../ai/verifier.js");
+                 const verifier = new CodeVerifier(browserManager, sendProgress);
+                 const fullPath = path.resolve(config.workspaceDir, filePath);
+                 const content = (await import("node:fs")).readFileSync(fullPath, "utf-8");
+                 const vResult = await verifier.verifyFile(filePath, content);
+                 if (!vResult.isOk) {
+                   return `Lệnh GHI FILE MÃ NGUỒN VẬT LÝ đã thành công, NHƯNG HỆ THỐNG TRỌNG TÀI KIỂM DUYỆT BÁO LỖI. \nLỗi: ${vResult.error}\n\n-> YÊU CẦU AGENT TỰ ĐỘNG PHÂN TÍCH LẠI LỖI VÀ GỌI LỆNH SỬA CHỮA NGAY LẬP TỨC TRONG LƯỢT NÀY!`;
+                 }
+              } catch (e) {
+                 console.error("[Verifier Error]", e);
+              }
             }
           }
           return result;
@@ -576,7 +641,28 @@ export async function handleInbound(
           const replacement = i.replacement_content ?? "";
           await sendProgress(`Đang sửa đổi file: ${filePath}`);
           const { replaceInFile } = await import("../plugins/fileio.js");
-          return replaceInFile(config.workspaceDir, filePath, target, replacement);
+          const result = await replaceInFile(config.workspaceDir, filePath, target, replacement);
+          if (result.startsWith("✅")) {
+            // KIỂM DUYỆT TRỌNG TÀI
+            const ext = path.extname(filePath).toLowerCase();
+            const isCodeFile = [".ts", ".js", ".py", ".go", ".java", ".cpp", ".c", ".rs", ".php"].includes(ext);
+            
+            if (isCodeFile) {
+              try {
+                 const { CodeVerifier } = await import("../ai/verifier.js");
+                 const verifier = new CodeVerifier(browserManager, sendProgress);
+                 const fullPath = path.resolve(config.workspaceDir, filePath);
+                 const content = (await import("node:fs")).readFileSync(fullPath, "utf-8");
+                 const vResult = await verifier.verifyFile(filePath, content);
+                 if (!vResult.isOk) {
+                   return `Lệnh SỬA FILE MÃ NGUỒN VẬT LÝ đã thành công, NHƯNG HỆ THỐNG TRỌNG TÀI KIỂM DUYỆT BÁO LỖI. \nLỗi: ${vResult.error}\n\n-> YÊU CẦU AGENT TỰ ĐỘNG PHÂN TÍCH LẠI LỖI VÀ GỌI LỆNH SỬA CHỮA NGAY LẬP TỨC TRONG LƯỢT NÀY!`;
+                 }
+              } catch (e) {
+                 console.error("[Verifier Error]", e);
+              }
+            }
+          }
+          return result;
         }
 
         case "append_to_file": {
@@ -621,9 +707,26 @@ export async function handleInbound(
           return `Chat history exported (${turns.length} turns).`;
         }
 
-        case "reset_session":
+        case "reset_session": {
           sessionManager.reset(sessionKey);
-          return "Chat history cleared.";
+          // Xóa tệp tạm tải lên (Img2Img) của người dùng hiện tại
+          try {
+             const fs = await import("node:fs");
+             const path = await import("node:path");
+             const tmpDir = path.resolve("./data/tmp");
+             if (fs.existsSync(tmpDir)) {
+               const files = fs.readdirSync(tmpDir);
+               for (const file of files) {
+                  if (file.startsWith(`upload_${msg.chatId}_`)) {
+                     fs.unlinkSync(path.join(tmpDir, file));
+                  }
+               }
+             }
+          } catch (e) {
+             console.error("[telegram] Failed to cleanup tmp files on reset", e);
+          }
+          return "Chat history cleared. Bất kỳ file tạm nào bạn đã tải lên cũng đã được xóa rác thành công.";
+        }
 
         case "browser_action": {
           const action = i.action ?? "";
@@ -634,11 +737,76 @@ export async function handleInbound(
           const result = await browserManager.executeAction(action, target, value);
           
           if (Buffer.isBuffer(result)) {
-            // Nếu là ảnh chụp màn hình
-            await channel.sendPhoto?.(msg.chatId, result, undefined);
-            return "Đã chụp ảnh màn hình và gửi thành công.";
+            // Nhận diện mã lõi Magic Bytes xem có phải tập tin hình ảnh không
+            const isImage = result.length > 4 && (
+              (result[0] === 0xFF && result[1] === 0xD8) || // JPEG
+              (result[0] === 0x89 && result[1] === 0x50 && result[2] === 0x4E && result[3] === 0x47) || // PNG
+              (result[0] === 0x47 && result[1] === 0x49 && result[2] === 0x46) || // GIF
+              (result[0] === 0x52 && result[1] === 0x49 && result[2] === 0x46 && result[3] === 0x46) // WEBP
+            );
+
+            if (isImage) {
+              await channel.sendPhoto?.(msg.chatId, result, undefined);
+              return "Đã chụp/tải ảnh màn hình và gửi thành công.";
+            } else {
+               // Nếu là file tải về nhưng không phải ảnh (VD PDF, ZIP, code) => Gửi nhét kèm
+              await channel.sendFileBuffer?.(msg.chatId, result, `downloaded_file_${Date.now()}.bin`, "Đã tải xuống thành công.");
+              return "Đã tải tập tin và gửi nguyên gốc file cho người dùng thành công.";
+            }
           }
           return result;
+        }
+
+        case "generate_image": {
+          const prompt = encodeURIComponent(i.prompt ?? "A aesthetic artwork");
+          const url = `https://image.pollinations.ai/prompt/${prompt}?width=1024&height=1024&nologo=true&seed=${Math.floor(Math.random() * 100000)}`;
+          
+          await sendProgress(`Đang gọi vệ tinh không gian vẽ ảnh: ${i.prompt}...`);
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) return `Lỗi báo từ máy chủ vẽ: HTTP ${resp.status}`;
+            const buf = await resp.arrayBuffer();
+            const nodeBuf = Buffer.from(buf);
+            
+            if (channel.sendPhoto) {
+              await channel.sendPhoto(msg.chatId, nodeBuf, `🖌 **Prompt:** ${i.prompt}`);
+              return `Ảnh đã vẽ xong và gửi cho user qua Telegram!`;
+            }
+            return `Lỗi hệ thống: Kênh Telegram không bắt được phương thức gửi ảnh.`;
+          } catch(e) {
+             return `Lỗi nội bộ khi tải ảnh: ${e instanceof Error ? e.message : String(e)}`;
+          }
+        }
+
+        case "manage_tasks": {
+          const action = i.action as string;
+          const tasks = i.tasks as unknown as any[];
+          
+          if (action === "create") {
+            taskManager.setTasks(msg.chatId, tasks);
+          } else if (action === "update") {
+            for (const t of tasks) {
+              taskManager.updateTask(msg.chatId, t.id, t.status, t.error_msg);
+            }
+          }
+          
+          const markdown = taskManager.buildMarkdown(msg.chatId);
+          // Gửi tin nhắn hoặc thay thế tin nhắn cũ
+          const oldMsgId = taskManager.getMessageId(msg.chatId);
+          
+          const sentId = await channel.send?.({
+             channel: msg.channel,
+             chatId: msg.chatId,
+             text: markdown,
+             editMessageId: oldMsgId,
+             isFinal: false
+          });
+          
+          if (sentId) {
+             taskManager.setMessageId(msg.chatId, sentId);
+          }
+          
+          return "Đã đồng bộ Checklist lên Telegram thành công.";
         }
 
         default:
@@ -697,9 +865,14 @@ export async function handleInbound(
       const streamHandle = channel.beginStream?.(msg.chatId);
       fullText = "";
 
-      // Áp dụng Controller mới cho từng lượt Retry (Tối đa 60s/lượt để tránh lỗi Treo Chết)
+      // Áp dụng Idle Timeout (60s): Chỉ hủy nếu kết nối mạng bị đơ. Nếu đang streaming liên tục thì gia hạn liên tục!
       const loopController = new AbortController();
-      const enforceTimeout = setTimeout(() => { loopController.abort("Quá thời gian phản hồi (Hard Timeout API)"); }, 60000);
+      let enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 60000);
+
+      const resetIdleTimeout = () => {
+        clearTimeout(enforceTimeout);
+        enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 60000);
+      };
 
       try {
         for await (const event of aiClient.stream({
@@ -714,9 +887,13 @@ export async function handleInbound(
           signal: loopController.signal,
           toolHandler,
         })) {
-          if (loopController.signal.aborted) break;
+          // Bắt lỗi Abort do timeout nếu SDK ngâm không chịu nhả error event ngay
+          if (loopController.signal.aborted && event.type !== "error") {
+             throw new Error("Timeout_Google_API");
+          }
 
           if (event.type === "delta") {
+            resetIdleTimeout(); // Cứ mỗi khi có chữ là gia hạn sự sống!
             fullText = event.fullText ?? fullText;
             streamHandle?.update(fullText);
           } else if (event.type === "done") {
@@ -738,10 +915,16 @@ export async function handleInbound(
       } catch (err) {
         const isAbort =
           err instanceof Error &&
-          (err.name === "AbortError" || err.message.includes("abort"));
+          (err.name === "AbortError" || err.message.toLowerCase().includes("abort") || err.name === "APIUserAbortError" || err.message.includes("Timeout_Google_API"));
 
         if (isAbort) {
           await streamHandle?.abort();
+          await channel.send({
+            channel: msg.channel,
+            chatId: msg.chatId,
+            text: "⚠️ Trí tuệ Gemma 4 đã tịt ngòi 60 giây (Chạm mốc Idle Timeout). Chắc do AI bị ngáo lú khi load Tool hoặc đứt mạng ngầm. Hệ thống đã tự động gián đoạn vòng lặp để an toàn.",
+            isFinal: true,
+          });
           return;
         }
 
@@ -767,8 +950,8 @@ export async function handleInbound(
           channel: msg.channel,
           chatId: msg.chatId,
           text: isOverloaded
-            ? "Server Anthropic đang quá tải, vui lòng thử lại sau ít phút."
-            : "Có lỗi xảy ra, vui lòng thử lại.",
+            ? "Server API đang quá tải hoặc gặp giới hạn, vui lòng thử lại sau ít phút."
+            : `[Lỗi API]: ${err instanceof Error ? err.message : String(err)}`,
           isFinal: true,
         });
         return;
@@ -784,12 +967,12 @@ export async function handleInbound(
   }
 
   if (!opts.noHistory) {
+    sessionManager.appendUserTurn(sessionKey, msg.text);
+
     if (finalAssistantMessages && finalAssistantMessages.length > 0) {
       for (const message of finalAssistantMessages) {
-        if (message.role === "assistant") {
-          sessionManager.appendAssistantTurn(sessionKey, message.content);
-        } else if (message.role === "user") {
-          sessionManager.appendUserTurn(sessionKey, message.content);
+        if (message.role === "assistant" || message.role === "tool") {
+          sessionManager.appendFullTurn(sessionKey, message);
         }
       }
     } else if (fullText) {
@@ -818,7 +1001,7 @@ function buildExportMarkdown(key: string, turns: { role: string; content: unknow
     ``,
   ];
   for (const t of turns) {
-    const role = t.role === "user" ? "👤 User" : "🤖 Claude";
+    const role = t.role === "user" ? "👤 User" : "🤖 Gemma";
     const content = typeof t.content === "string" ? t.content : JSON.stringify(t.content);
     lines.push(`### ${role}\n\n${content}\n`);
   }

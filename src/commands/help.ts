@@ -8,7 +8,7 @@ export const HelpCommand: ICommand = {
   category: "basic",
   execute: async (ctx: Context, args: string, deps: CommandDeps) => {
     const commands = registry.getAll();
-    let text = `🤖 *Clawbot* — Claude trên Telegram\n\n`;
+    let text = `🤖 *Clawbot* — Gemma 4 trên Telegram\n\n`;
     text += `*Lệnh hiện có:*\n`;
     for (const cmd of commands) {
       if (cmd.category === "hidden") continue;

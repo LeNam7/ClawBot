@@ -1,10 +1,13 @@
 // Common AI types shared across all providers
 
-export type MessageRole = "user" | "assistant";
+export type MessageRole = "user" | "assistant" | "tool";
 
 export interface MessageParam {
   role: MessageRole;
   content: any; // Allow Anthropic array objects (text, tool_use, tool_result)
+  tool_calls?: any[];
+  tool_call_id?: string;
+  name?: string;
 }
 
 export interface AIStreamEvent {
@@ -20,7 +23,7 @@ export interface ToolDefinition {
   description: string;
   input_schema: {
     type: "object";
-    properties: Record<string, { type: string; description?: string; enum?: string[] }>;
+    properties: Record<string, any>;
     required?: string[];
   };
 }

@@ -93,6 +93,26 @@ export class BrowserManager {
           // --- Kết thúc bảo mật ---
 
           await p.goto(target, { waitUntil: "domcontentloaded", timeout: 30000 });
+          
+          if (host.includes("gemini")) {
+            // Tự động triệt tiêu các popup phiền phức của Gemini (chướng ngại vật che màn hình)
+            await p.evaluate(() => {
+               const killPopups = () => {
+                  document.querySelectorAll('mat-dialog-container, .mdc-dialog, [role="dialog"]').forEach(el => {
+                     const btn = el.querySelector('button');
+                     if (btn && btn.innerText.match(/không|bỏ qua|no|dismiss/i)) {
+                        (btn as HTMLElement).click();
+                     } else {
+                        el.remove();
+                     }
+                  });
+               };
+               setTimeout(killPopups, 500);
+               setTimeout(killPopups, 2000);
+               setTimeout(killPopups, 5000);
+            }).catch(() => {});
+          }
+          
           return `Navigated to ${target}. Current title: ${await p.title()}`;
         }
         case "click":
@@ -131,6 +151,53 @@ export class BrowserManager {
             ? text.slice(0, 40000) + "\n...[Text truncated due to length limits]" 
             : text || "[No text found on page]";
         }
+
+        case "extract_gemini_thought": {
+          const result = await p.evaluate(() => {
+             // 1. Phân mảnh tin nhắn: Xác định khối trả lời cuối cùng mới nhất
+             const messageBlocks = Array.from(document.querySelectorAll('message-content, .message-content, [data-test-id="message-content"]'));
+             if (messageBlocks.length === 0) return "⚠️ Không tìm thấy phản hồi nào.";
+             
+             const lastBlock = messageBlocks[messageBlocks.length - 1];
+             const parentContainer = lastBlock.closest('body') || document;
+             
+             // 2. Định vị Khối Tư Duy (Thought Process)
+             // Gemini thường nhét tư duy vào thẻ <details> hoặc thẻ có class chứa từ "thought"
+             let thoughtData = "";
+             const detailBoxes = parentContainer.querySelectorAll('details, [class*="thought"], [data-test-id*="thought"]');
+             
+             // Chỉ xét các khối suy nghĩ nằm ở cụm tin nhắn cuối
+             const lastDetailBox = detailBoxes.length > 0 ? detailBoxes[detailBoxes.length - 1] : null;
+             
+             if (lastDetailBox) {
+                // Ép mở thẻ ẩn bằng code JS (Bỏ qua hiệu ứng hover)
+                lastDetailBox.setAttribute('open', 'true');
+                if (lastDetailBox.classList) lastDetailBox.classList.add('expanded');
+                
+                // Lấy thô toàn bộ nội tâm gạch xoá
+                thoughtData = (lastDetailBox as HTMLElement).innerText.trim();
+             }
+             
+             // 3. Định vị Khối Trả Lời Cuối Cùng (Final Output)
+             const finalAnswer = (lastBlock as HTMLElement).innerText.trim();
+             
+             // 4. Lắp ráp và Đóng gói gửi về Telegram
+             let outputStr = "";
+             if (thoughtData && thoughtData.length > 10) {
+                 outputStr += "💭 **[NỘI TÂM CỦA GEMINI]**\n";
+                 outputStr += "```text\n" + thoughtData + "\n```\n\n";
+                 outputStr += "===========================\n\n";
+             }
+             
+             outputStr += "✅ **[CÂU TRẢ LỜI CHÍNH THỨC]**\n" + finalAnswer;
+             return outputStr;
+          });
+
+          return result.length > 40000 
+            ? result.slice(0, 40000) + "\n...[Đã cắt bớt do quá dài]" 
+            : result;
+        }
+
           
         case "screenshot": {
           const buffer = await p.screenshot({ type: "jpeg", quality: 80, fullPage: false });
@@ -145,6 +212,14 @@ export class BrowserManager {
           return buffer;
         }
 
+        case "upload": {
+          if (!target) return "Missing CSS selector target for <input type='file'>";
+          if (!value) return "Missing file path value to upload";
+          await p.waitForSelector(target, { state: 'attached', timeout: 10000 });
+          await p.setInputFiles(target, value);
+          return `Đã upload file thành công từ đường dẫn cục bộ: ${value}`;
+        }
+
         case "evaluate": {
           if (!target) return "Missing JavaScript code in target";
           const result = await p.evaluate(target);
@@ -152,8 +227,62 @@ export class BrowserManager {
           return String(result);
         }
 
+        case "download": {
+          if (!target) return "Missing CSS selector target for download button";
+          // Đợi lên tới 60s cho tới khi cái nút xuất hiện trong DOM (dù nó bị ẩn tàng hình vẫn tính)
+          await p.waitForSelector(target, { state: 'attached', timeout: 60000 });
+          const downloadPromise = p.waitForEvent("download", { timeout: 60000 });
+          
+          // Dùng evaluate để ép click trực tiếp vào DOM (Bỏ qua việc phải di chuột Hover để làm nút hiện lên)
+          await p.evaluate((sel) => {
+             const elements = document.querySelectorAll(sel);
+             if (elements.length === 0) throw new Error("Download button not found in DOM");
+             // Nếu có nhiều nút tải, ưu tiên nút cuối cùng (thường là ảnh mới vẽ nhất)
+             const btn = elements[elements.length - 1] as HTMLElement;
+             btn.click();
+          }, target);
+
+          const download = await downloadPromise;
+          const rs = await download.createReadStream();
+          if (!rs) return "Failed to establish download stream.";
+          
+          const chunks: Buffer[] = [];
+          for await (const chunk of rs) {
+            chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+          }
+          return Buffer.concat(chunks);
+        }
+
+        case "extract_image": {
+          if (!target) return "Missing CSS selector target for extract_image";
+          await p.waitForSelector(target, { state: 'visible', timeout: 10000 });
+          
+          const imgSrc = await p.evaluate((sel) => {
+             const img = document.querySelector(sel) as HTMLImageElement;
+             if (!img || img.tagName.toLowerCase() !== 'img') throw new Error("Target must be an <img> tag");
+             return img.src;
+          }, target);
+          
+          if (!imgSrc) return "Failed to extract image source URL.";
+
+          try {
+             if (imgSrc.startsWith("data:image")) {
+                const b64 = imgSrc.split(",")[1];
+                if (!b64) throw new Error("Invalid data URI");
+                return Buffer.from(b64, 'base64');
+             }
+
+             const response = await fetch(imgSrc);
+             if (!response.ok) throw new Error("HTTP " + response.status);
+             const arrayBuffer = await response.arrayBuffer();
+             return Buffer.from(arrayBuffer);
+          } catch (err: any) {
+             return `Lỗi tải ảnh trực tiếp: ${err.message}. Gợi ý chiến thuật cho AI: Vì tính năng 'extract_image' bị chặn tải lén, bạn BẮT BUỘC HÃY chuyển sang dùng 'element_screenshot' và truyền đúng Selector lúc nãy vào tĩnh năng này để chụp cắt duy nhất cái khung tranh đó và gửi cho User nhé.`;
+          }
+        }
+
         default:
-          return `Unknown browser action: ${action}. Allowed: goto, click, type, scroll, extract_text, screenshot, element_screenshot, evaluate.`;
+          return `Unknown browser action: ${action}. Allowed: goto, click, type, scroll, extract_text, screenshot, element_screenshot, evaluate, download, extract_image.`;
       }
     } catch (err: any) {
       return `Browser action failed: ${err.message}`;

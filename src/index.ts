@@ -118,6 +118,15 @@ async function main() {
   }
   console.log("[clawbot] ready ✓");
 
+  // Start Dreaming Service
+  const { startDreamingService } = await import("./ai/dream.js");
+  const channelForNotify = registry.get("telegram");
+  const adminId = config.allowedUserIds[0];
+  const adminNotify = adminId && channelForNotify && channelForNotify.send ? async (msg: string) => {
+     await channelForNotify.send!({ channel: "telegram", chatId: adminId, text: msg, isFinal: true });
+  } : undefined;
+  startDreamingService(config, aiClient, adminNotify);
+
   // 9. Graceful shutdown
   const shutdown = async () => {
     console.log("\n[clawbot] shutting down...");

@@ -19,8 +19,11 @@ export interface OutboundMessage {
 export type SessionKey = string;
 
 export interface ConversationTurn {
-  role: "user" | "assistant";
-  content: string;
+  role: "user" | "assistant" | "tool";
+  content: any;
+  tool_calls?: any[];
+  tool_call_id?: string;
+  name?: string;
   createdAt: string;
 }
 

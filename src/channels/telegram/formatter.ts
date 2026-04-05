@@ -5,9 +5,11 @@ export function escapeMarkdownV2(text: string): string {
   return text.replace(SPECIAL_CHARS, (c) => `\\${c}`);
 }
 
-// Simple conversion: preserve code blocks, escape everything else
 export function formatForTelegram(text: string): string {
-  const parts = text.split(/(```[\s\S]*?```|`[^`]+`)/g);
+  // Hoàn toàn xóa <thought>...</thought> ra khỏi kết quả cuối cùng
+  let formattedText = text.replace(/<thought>[\s\S]*?(<\/thought>|$)/gi, "").trimStart();
+
+  const parts = formattedText.split(/(```[\s\S]*?```|`[^`]+`)/g);
   return parts
     .map((part, i) => {
       if (i % 2 === 1) return part; // code block — keep as-is

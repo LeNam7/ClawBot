@@ -85,12 +85,23 @@ export class TelegramChannel implements IChannel {
       if (!photo) return;
 
       let imageBase64: string | undefined;
+      let uploadedImagePath: string | undefined;
       try {
         const file = await ctx.getFile();
         const fileUrl = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
         const resp = await fetch(fileUrl);
         const buf = await resp.arrayBuffer();
-        imageBase64 = Buffer.from(buf).toString("base64");
+        const bufferOrig = Buffer.from(buf);
+        imageBase64 = bufferOrig.toString("base64");
+        
+        // Lưu ra file tạm để Trình duyệt dùng cho Img2Img
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const tmpDir = path.resolve("./data/tmp");
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+        // Định dạng file là JPEG vì Bot nhận được định dạng mặc định của Telegram là JPG
+        uploadedImagePath = path.join(tmpDir, `upload_${ctx.chat.id}_${Date.now()}.jpg`);
+        fs.writeFileSync(uploadedImagePath, bufferOrig);
       } catch (err) {
         console.error("[telegram] photo download error:", err);
       }
@@ -102,7 +113,7 @@ export class TelegramChannel implements IChannel {
         chatId: String(ctx.chat.id),
         text: caption || "Ảnh này có gì?",
         receivedAt: new Date().toISOString(),
-        raw: { ctx, imageBase64, mimeType: "image/jpeg" },
+        raw: { ctx, imageBase64, mimeType: "image/jpeg", uploadedImagePath },
       };
 
       void ctx.replyWithChatAction("typing");
