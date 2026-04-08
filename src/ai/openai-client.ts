@@ -21,7 +21,7 @@ export class OpenAIClient implements AIClient {
     try {
       let currentMessages = buildMessages(req);
       const tools = req.toolHandler?.tools.map(toOpenAITool) ?? [];
-      const MAX_STEPS = 25;
+      const MAX_STEPS = 100; // Mở khóa sức mạnh trâu bò cho Autonomous Agent
 
       for (let step = 0; step < MAX_STEPS; step++) {
         const params: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
@@ -32,9 +32,28 @@ export class OpenAIClient implements AIClient {
           ...(tools.length ? { tools, tool_choice: "auto" as const, parallel_tool_calls: false } : {}),
         };
 
-        const stream = await this.client.chat.completions.create(params, {
-          signal: req.signal,
-        });
+        let stream;
+        let attempt = 0;
+        const MAX_RETRIES = 5;
+        while (attempt < MAX_RETRIES) {
+          try {
+            stream = await this.client.chat.completions.create(params, {
+              signal: req.signal,
+            });
+            break;
+          } catch (err: any) {
+            if (err.status === 429 || err?.message?.includes("429")) {
+              attempt++;
+              const backoff = attempt * 10000; // Đợi 10s, 20s, 30s...
+              console.log(`[openai-client] Bị chặn API Rate Limit 429. Chờ ${backoff/1000}s trước khi thử lại (Lần ${attempt}/${MAX_RETRIES})...`);
+              yield { type: "delta", delta: `\n\n_...Đang chờ ${backoff/1000}s vì bị giới hạn API..._\n`, fullText: fullText };
+              await new Promise(r => setTimeout(r, backoff));
+            } else {
+              throw err;
+            }
+          }
+        }
+        if (!stream) throw new Error("API failed after maximum retries due to 429 rate limit.");
 
         // Accumulate tool calls across chunks
         const toolCallsMap: Record<number, {
@@ -47,6 +66,9 @@ export class OpenAIClient implements AIClient {
         let stepText = "";
 
         for await (const chunk of stream) {
+          // Emit heartbeat for EVERY chunk received to keep the idle timeout alive!
+          yield { type: "heartbeat" };
+
           const choice = chunk.choices[0];
           if (!choice) continue;
 
@@ -117,8 +139,6 @@ export class OpenAIClient implements AIClient {
             let validArgs = tc.arguments;
             try {
               const parsed = JSON.parse(validArgs || "{}");
-              // --- HỆ THỐNG TRIMMING (CONTEXT COMPACTION) ---
-              // Quét để nén các trường nội dung quá dài (>2500 ký tự) xuống còn ~1000 ký tự
               let isCompressed = false;
               for (const key in parsed) {
                 if (typeof parsed[key] === "string" && parsed[key].length > 2500) {
@@ -145,7 +165,7 @@ export class OpenAIClient implements AIClient {
 
           const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = {
             role: "assistant",
-            content: stepText || "",
+            content: stepText || null, // FIX 400 error schema requirements
             tool_calls: assistantToolCalls,
           };
 
@@ -157,9 +177,13 @@ export class OpenAIClient implements AIClient {
           
           console.log(`[step ${step}] Appended tools. currentMessages.length now:`, currentMessages.length);
           continue;
-        } else {
-          let visibleText = (stepText || "").replace(/<thought>[\s\S]*?<\/thought>/g, "");
-          visibleText = visibleText.replace(/<thought>[\s\S]*$/g, "").trim(); // Quét luôn cả thẻ mở mà không có đóng ở cuối đoạn
+        } 
+        
+        // --- NẾU KHÔNG CÓ TOOL CALLS NÀO ĐƯỢC GỌI NỮA ---
+        // Bỏ chế độ tự động BREAK vòng lặp ở đây. 
+        // Cho phép Bot vừa sinh ra text, vừa gọi tool tiếp nếu nó muốn hoàn thành các bước tiếp theo.
+        let visibleText = (stepText || "").replace(/<thought>[\s\S]*?<\/thought>/g, "");
+          visibleText = visibleText.replace(/<thought>[\s\S]*$/g, "").trim();
           
           console.log(`[step ${step}] No tool calls. visibleText=`, visibleText === "" ? "EMPTY" : visibleText.substring(0,20));
           if (visibleText === "") {
@@ -172,9 +196,10 @@ export class OpenAIClient implements AIClient {
              console.log(`[step ${step}] WATCHDOG TICKED! currentMessages.length now:`, currentMessages.length);
              continue;
           }
-          console.log(`[step ${step}] Breaking loop! visibleText is NOT EMPTY or loop ends.`);
+          
+          // Trừ khi model thực sự nói "Xong/Hoàn tất" và không gọi tool nào thì vòng lặp mới được phép kết thúc tự nhiên.
+          console.log(`[step ${step}] Breaking loop! AI has finalized response without extra tools.`);
           break;
-        }
       }
 
       const startIndex = req.systemPrompt ? req.history.length + 2 : req.history.length + 1;

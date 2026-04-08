@@ -12,6 +12,7 @@ import { createServer } from "./gateway/server.js";
 import { CronManager } from "./plugins/cron.js";
 import { SecurityManager } from "./core/security.js";
 import { BrowserManager } from "./plugins/browser.js";
+import { ContextManager } from "./core/context.js";
 import path from "node:path";
 
 async function main() {
@@ -52,6 +53,7 @@ async function main() {
   registry.register(cli);
 
   const browserManager = new BrowserManager(config.workspaceDir);
+  const contextManager = new ContextManager(config);
 
   // 5. Pipeline deps
   const deps: HandlerDeps = {
@@ -60,6 +62,7 @@ async function main() {
     channelRegistry: registry,
     config,
     browserManager,
+    contextManager,
   };
   
   // Gắn event onMessage chung cho tất cả channel
@@ -125,7 +128,7 @@ async function main() {
   const adminNotify = adminId && channelForNotify && channelForNotify.send ? async (msg: string) => {
      await channelForNotify.send!({ channel: "telegram", chatId: adminId, text: msg, isFinal: true });
   } : undefined;
-  startDreamingService(config, aiClient, adminNotify);
+  startDreamingService(config, aiClient, db, adminNotify);
 
   // 9. Graceful shutdown
   const shutdown = async () => {

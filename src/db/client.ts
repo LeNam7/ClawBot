@@ -35,6 +35,10 @@ export class JsonStore {
     return this.store.sessions[key];
   }
 
+  getAllSessions(): Record<string, SessionRow> {
+    return this.store.sessions;
+  }
+
   upsertSession(data: { key: string; channel: string; userId: string; chatId: string }) {
     const now = new Date().toISOString();
     if (!this.store.sessions[data.key]) {

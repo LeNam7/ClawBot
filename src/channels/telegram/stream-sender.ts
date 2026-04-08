@@ -35,14 +35,20 @@ export class TelegramStreamSender {
     if (this.stopped) return;
     const text = this.fullText.trim();
     if (this.lastSentText !== null && text === this.lastSentText) return;
-    // Parse HTML đẹp trong lúc gõ cho thẻ <thought>
-    let safeText = text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+    // Tự động ẩn các "Quá trình suy nghĩ" ĐÃ KẾT THÚC (có thẻ đóng </thought> hoặc </think>)
+    // Hủy bỏ chúng khỏi văn bản đang hiển thị để tránh rối mắt.
+    let displayTxt = text.replace(/<(thought|think)>[\s\S]*?<\/\1>/gi, " ");
+    
+    // Xử lý html
+    let safeText = displayTxt.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
     let inThought = false;
-    safeText = safeText.replace(/&lt;thought&gt;/g, () => {
+    safeText = safeText.replace(/&lt;(thought|think)&gt;/gi, () => {
       inThought = true;
       return "<blockquote>💭 <i>Quá trình suy nghĩ:</i>\n";
     });
-    safeText = safeText.replace(/&lt;\/thought&gt;/g, () => {
+    safeText = safeText.replace(/&lt;\/(thought|think)&gt;/gi, () => {
       inThought = false;
       return "</blockquote>\n";
     });

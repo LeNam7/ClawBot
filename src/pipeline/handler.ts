@@ -7,9 +7,7 @@ import type { CronManager } from "../plugins/cron.js";
 import { registerStream, deregisterStream } from "./active-streams.js";
 import { createApproval } from "./approval.js";
 import { runBash } from "../plugins/bash.js";
-import { getWeather } from "../plugins/skills/weather.js";
-import { getDatetime } from "../plugins/skills/datetime.js";
-import { calculate } from "../plugins/skills/calc.js";
+import { loader, ensureLoaded } from "../plugins/skills/index.js";
 import { fetchUrl } from "../plugins/fetch.js";
 import { webSearch, executeGlob, executeGrep } from "../plugins/search.js";
 import { searchMemory } from "../memory/search.js";
@@ -19,7 +17,9 @@ import path from "node:path";
 import fs from "node:fs";
 import { classifyComplexity, selectModel } from "../ai/router.js";
 import type { BrowserManager } from "../plugins/browser.js";
+import { SkillLoader } from "../ai/skill-loader.js";
 import { taskManager } from "../plugins/task.js";
+import type { ContextManager } from "../core/context.js";
 
 initHooks();
 
@@ -112,51 +112,7 @@ const TOOLS: ToolDefinition[] = [
       required: ["id"],
     },
   },
-  {
-    name: "get_weather",
-    description:
-      "Get the current weather for a location. Use when the user asks about weather, temperature, or forecast.",
-    input_schema: {
-      type: "object",
-      properties: {
-        location: {
-          type: "string",
-          description: "City or location name, e.g. 'Ho Chi Minh City', 'Hanoi', 'London'",
-        },
-      },
-      required: ["location"],
-    },
-  },
-  {
-    name: "get_datetime",
-    description:
-      "Get the current date and time. Use when the user asks what time or date it is.",
-    input_schema: {
-      type: "object",
-      properties: {
-        timezone: {
-          type: "string",
-          description: "Optional IANA timezone, e.g. 'Asia/Ho_Chi_Minh'. Defaults to Vietnam time.",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "calculate",
-    description:
-      "Evaluate a mathematical expression and return the result. Use for arithmetic, percentages, exponents, etc.",
-    input_schema: {
-      type: "object",
-      properties: {
-        expression: {
-          type: "string",
-          description: "Math expression, e.g. '(12 + 8) * 5 / 2', '2^10', '15% of 240'",
-        },
-      },
-      required: ["expression"],
-    },
-  },
+
   {
     name: "run_bash",
     description:
@@ -448,6 +404,7 @@ export interface HandlerDeps {
   config: Config;
   cronManager?: CronManager;
   browserManager: BrowserManager;
+  contextManager?: ContextManager;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -483,6 +440,7 @@ export async function handleInbound(
 
   // Helper: Hiển thị tiến trình UI rõ ràng giúp người dùng hết cảm giác bị mù (Blind UX)
   let progressMsgId: string | undefined;
+  let keepAliveCallback: (() => void) | undefined;
   const sendProgress = async (text?: string) => {
     try {
       if (!progressMsgId) {
@@ -505,19 +463,27 @@ export async function handleInbound(
     } catch { /* ignore */ }
   };
 
+  // Ensure dynamic skills are loaded
+  await ensureLoaded();
+
   // Tool executor
   const toolHandler: ToolHandler = {
-    tools: TOOLS,
+    tools: [...TOOLS, ...loader.getDefinitions()],
     execute: async (name, input): Promise<string> => {
-      const i = input as Record<string, string>;
+      const pingInterval = setInterval(() => {
+        if (keepAliveCallback) keepAliveCallback();
+      }, 10000);
 
-      const hookCtx = {
-        chatId: msg.chatId,
-        userId: msg.userId,
-        channel: msg.channel,
-        deps,
-        historySize: history.length,
-      };
+      try {
+        const i = input as Record<string, string>;
+
+        const hookCtx = {
+          chatId: msg.chatId,
+          userId: msg.userId,
+          channel: msg.channel,
+          deps,
+          historySize: history.length,
+        };
       
       const hookRes = await hookRegistry.runPreToolUse(hookCtx, name, i);
       if (!hookRes.allowed) {
@@ -557,16 +523,7 @@ export async function handleInbound(
           return success ? `Reminder ${target.id.slice(-6)} deleted successfully.` : `Failed to delete reminder ${id}.`;
         }
 
-        case "get_weather":
-          return await getWeather(i.location ?? "Ho Chi Minh City");
 
-        case "get_datetime":
-          return getDatetime(i.timezone ?? undefined);
-
-        case "calculate": {
-          const expr = i.expression.replace(/(\d+)%\s+of\s+(\d+)/i, "($1/100)*$2");
-          return calculate(expr);
-        }
 
         case "run_bash": {
           const command = i.command ?? "";
@@ -794,7 +751,7 @@ export async function handleInbound(
           // Gửi tin nhắn hoặc thay thế tin nhắn cũ
           const oldMsgId = taskManager.getMessageId(msg.chatId);
           
-          const sentId = await channel.send?.({
+          const sentId = await channel.send({
              channel: msg.channel,
              chatId: msg.chatId,
              text: markdown,
@@ -809,8 +766,15 @@ export async function handleInbound(
           return "Đã đồng bộ Checklist lên Telegram thành công.";
         }
 
-        default:
+        default: {
+          if (loader.getDefinitions().some(s => s.name === name)) {
+             return await loader.executeSkill(name, i, deps);
+          }
           return `Unknown tool: ${name}`;
+        }
+      }
+      } finally {
+        clearInterval(pingInterval);
       }
     },
   };
@@ -860,19 +824,25 @@ export async function handleInbound(
   let fullText = "";
   let finalAssistantMessages: any[] | undefined = undefined;
 
+  // Luôn lưu ngay user turn vào CSDL trước khi xử lý, để chống mất ngữ cảnh khi API trả lỗi giữa chừng
+  if (!opts.noHistory) {
+    sessionManager.appendUserTurn(sessionKey, msg.text);
+  }
+
   try {
     while (true) {
       const streamHandle = channel.beginStream?.(msg.chatId);
       fullText = "";
 
-      // Áp dụng Idle Timeout (60s): Chỉ hủy nếu kết nối mạng bị đơ. Nếu đang streaming liên tục thì gia hạn liên tục!
+      // Áp dụng Idle Timeout (300s): Nới lỏng thời gian cho model vì file context bây giờ quá khổng lồ (250k tokens)
       const loopController = new AbortController();
-      let enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 60000);
+      let enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 300000);
 
       const resetIdleTimeout = () => {
         clearTimeout(enforceTimeout);
-        enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 60000);
+        enforceTimeout = setTimeout(() => { loopController.abort(new Error("Timeout_Google_API")); }, 300000);
       };
+      keepAliveCallback = resetIdleTimeout;
 
       try {
         for await (const event of aiClient.stream({
@@ -892,10 +862,12 @@ export async function handleInbound(
              throw new Error("Timeout_Google_API");
           }
 
-          if (event.type === "delta") {
+          if (event.type === "delta" || event.type === "heartbeat") {
             resetIdleTimeout(); // Cứ mỗi khi có chữ là gia hạn sự sống!
-            fullText = event.fullText ?? fullText;
-            streamHandle?.update(fullText);
+            if (event.type === "delta") {
+              fullText = event.fullText ?? fullText;
+              streamHandle?.update(fullText);
+            }
           } else if (event.type === "done") {
             fullText = event.fullText ?? fullText;
             finalAssistantMessages = event.assistantMessages;
@@ -922,7 +894,7 @@ export async function handleInbound(
           await channel.send({
             channel: msg.channel,
             chatId: msg.chatId,
-            text: "⚠️ Trí tuệ Gemma 4 đã tịt ngòi 60 giây (Chạm mốc Idle Timeout). Chắc do AI bị ngáo lú khi load Tool hoặc đứt mạng ngầm. Hệ thống đã tự động gián đoạn vòng lặp để an toàn.",
+            text: "⚠️ Trí tuệ Gemma 4 đã tịt ngòi 300 giây (Chạm mốc Idle Timeout). Chắc do file context bạn gửi quá khổng lồ khiến AI mất hơn 5 phút chỉ để đọc! Đã tự động ngắt kết nối an toàn.",
             isFinal: true,
           });
           return;
@@ -964,19 +936,18 @@ export async function handleInbound(
     if (progressMsgId && channel.id === "telegram") {
       try { await (channel as any).bot.api.deleteMessage(msg.chatId, Number(progressMsgId)); } catch {}
     }
-  }
 
-  if (!opts.noHistory) {
-    sessionManager.appendUserTurn(sessionKey, msg.text);
-
-    if (finalAssistantMessages && finalAssistantMessages.length > 0) {
-      for (const message of finalAssistantMessages) {
-        if (message.role === "assistant" || message.role === "tool") {
-          sessionManager.appendFullTurn(sessionKey, message);
+    // Lưu lại đoạn hội thoại partial/final của bot vào lịch sử để Bot nhớ nó đã làm gì trước khi bị tắt ngang.
+    if (!opts.noHistory) {
+      if (finalAssistantMessages && finalAssistantMessages.length > 0) {
+        for (const message of finalAssistantMessages) {
+          if (message.role === "assistant" || message.role === "tool") {
+            sessionManager.appendFullTurn(sessionKey, message);
+          }
         }
+      } else if (fullText) {
+        sessionManager.appendAssistantTurn(sessionKey, fullText);
       }
-    } else if (fullText) {
-      sessionManager.appendAssistantTurn(sessionKey, fullText);
     }
   }
 }

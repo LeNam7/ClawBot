@@ -6,8 +6,8 @@ export function escapeMarkdownV2(text: string): string {
 }
 
 export function formatForTelegram(text: string): string {
-  // Hoàn toàn xóa <thought>...</thought> ra khỏi kết quả cuối cùng
-  let formattedText = text.replace(/<thought>[\s\S]*?(<\/thought>|$)/gi, "").trimStart();
+  // Hoàn toàn xóa <thought>...</thought> và <think>...</think> ra khỏi kết quả cuối cùng
+  let formattedText = text.replace(/<(thought|think)>[\s\S]*?(<\/\1>|$)/gi, "").trimStart();
 
   const parts = formattedText.split(/(```[\s\S]*?```|`[^`]+`)/g);
   return parts

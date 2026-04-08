@@ -9,6 +9,7 @@ import { BashCommand } from "./bash.js";
 import { SkillCommand } from "./skill.js";
 import { BtwCommand } from "./btw.js";
 import { CronCommand } from "./cron.js";
+import { ReloadSkillsCommand } from "./reload_skills.js";
 
 export function registerAllCommands() {
   registry.register(HelpCommand);
@@ -21,6 +22,7 @@ export function registerAllCommands() {
   registry.register(SkillCommand);
   registry.register(BtwCommand);
   registry.register(CronCommand);
+  registry.register(ReloadSkillsCommand);
 }
 
 export { registry };

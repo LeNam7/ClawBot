@@ -11,7 +11,7 @@ export interface MessageParam {
 }
 
 export interface AIStreamEvent {
-  type: "delta" | "done" | "error";
+  type: "delta" | "done" | "error" | "heartbeat";
   delta?: string;
   fullText?: string;
   assistantMessages?: MessageParam[]; // Trả về mảng messages hoàn chỉnh của turn này
