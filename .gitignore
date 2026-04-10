@@ -5,3 +5,4 @@ dist/
 workspace/
 server_log.txt
 $null
+vendor/

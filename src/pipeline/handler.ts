@@ -1,4 +1,13 @@
 import type { InboundMessage } from "../core/types.js";
+import { SkillManager } from "../skills/manager.js";
+const skillManager = new SkillManager(process.cwd());
+let skillsLoaded = false;
+export async function ensureSkillsLoaded() {
+  if (!skillsLoaded) { 
+    await skillManager.loadSkills(); 
+    skillsLoaded = true; 
+  }
+}
 import type { AIClient, ToolHandler, ToolDefinition } from "../ai/types.js";
 import type { SessionManager } from "../session/manager.js";
 import type { ChannelRegistry } from "../channels/registry.js";
@@ -6,19 +15,12 @@ import type { Config } from "../config/env.js";
 import type { CronManager } from "../plugins/cron.js";
 import { registerStream, deregisterStream } from "./active-streams.js";
 import { createApproval } from "./approval.js";
-import { runBash } from "../plugins/bash.js";
-import { loader, ensureLoaded } from "../plugins/skills/index.js";
-import { fetchUrl } from "../plugins/fetch.js";
-import { webSearch, executeGlob, executeGrep } from "../plugins/search.js";
-import { searchMemory } from "../memory/search.js";
 import { hookRegistry, initHooks } from "../hooks/index.js";
-import { readFile, writeFile, listDir } from "../plugins/fileio.js";
 import path from "node:path";
 import fs from "node:fs";
 import { classifyComplexity, selectModel } from "../ai/router.js";
 import type { BrowserManager } from "../plugins/browser.js";
 import { SkillLoader } from "../ai/skill-loader.js";
-import { taskManager } from "../plugins/task.js";
 import type { ContextManager } from "../core/context.js";
 
 initHooks();
@@ -57,343 +59,7 @@ function isDangerous(command: string): boolean {
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
 
-const TOOLS: ToolDefinition[] = [
-  {
-    name: "create_reminder",
-    description:
-      "Create a scheduled reminder (one-shot or recurring). " +
-      "STRICT RULES: " +
-      "1. ONLY call this tool when user EXPLICITLY requests a reminder with clear words: nhắc, đặt lịch, thông báo lúc, báo tôi lúc, remind me, set alarm. " +
-      "2. NEVER call this tool just because user mentions time or activity. " +
-      "3. ALWAYS ask 'Bạn muốn nhắc 1 lần hay lặp lại hằng ngày?' BEFORE calling this tool, unless user already specified. " +
-      "4. For one-shot: use a future datetime cron or pass one_shot=true. " +
-      "5. Default assumption is ONE-TIME unless user says daily/hằng ngày/mỗi ngày.",
-    input_schema: {
-      type: "object",
-      properties: {
-        cron_expression: {
-          type: "string",
-          description:
-            "Standard 5-field cron expression: minute hour day month weekday. " +
-            "Examples: '10 12 * * *' = daily at 12:10, '0 8 * * 1-5' = weekdays at 8:00",
-        },
-        message: {
-          type: "string",
-          description: "The reminder message to send. Use the same language as the user.",
-        },
-        one_shot: {
-          type: "boolean",
-          description: "If true, reminder runs once only. Default true unless user explicitly wants recurring.",
-        },
-      },
-      required: ["cron_expression", "message"],
-    },
-  },
-  {
-    name: "list_reminders",
-    description: "List all active reminders and scheduled jobs for the current user/chat. Use when the user asks what tasks or reminders are currently scheduled.",
-    input_schema: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "delete_reminder",
-    description: "Delete a specific reminder by its ID. Use when the user asks to cancel or remove a scheduled reminder.",
-    input_schema: {
-      type: "object",
-      properties: {
-        id: {
-          type: "string",
-          description: "The ID of the reminder to delete (usually the last 6 characters or full ID).",
-        },
-      },
-      required: ["id"],
-    },
-  },
-
-  {
-    name: "run_bash",
-    description:
-      "Execute a shell command. By default, this runs securely in a Docker sandbox (node:22-alpine). " +
-      "If the sandbox is not available, it FALLS BACK to executing NATIVELY on the HOST OS. " +
-      "Since the host is Windows, you MUST use PowerShell commands if the execution is native.",
-    input_schema: {
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description: "The shell command to run",
-        },
-      },
-      required: ["command"],
-    },
-  },
-  {
-    name: "fetch_url",
-    description:
-      "Fetch the text content of a URL. Use when the user asks to read a webpage, check a link, or get content from the internet.",
-    input_schema: {
-      type: "object",
-      properties: {
-        url: {
-          type: "string",
-          description: "The full URL to fetch, e.g. 'https://example.com'",
-        },
-      },
-      required: ["url"],
-    },
-  },
-  {
-    name: "web_search",
-    description:
-      "Search the web for information. Use when the user asks about current events, facts, or anything that requires searching online.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "The search query",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "memory_search",
-    description:
-      "Search through saved conversation history (memories) for relevant past discussions. " +
-      "Use when the user references past conversations, asks 'what did we talk about', or seems to expect context from older chats.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Keywords or topic to search for in past conversations",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "read_file",
-    description:
-      "Đọc nội dung file trong workspace. Dùng khi cần xem code hiện tại, đọc config, hoặc review file.",
-    input_schema: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "Đường dẫn file tương đối trong workspace, ví dụ: 'src/index.ts', 'README.md'",
-        },
-      },
-      required: ["path"],
-    },
-  },
-  {
-    name: "write_file",
-    description:
-      "Ghi nội dung vào file trong workspace. Tự động chọn định dạng theo đuôi file: " +
-      ".docx (Word) — content là text/markdown với heading #/##/###; " +
-      ".xlsx (Excel) — content là CSV hoặc JSON array; " +
-      ".pdf (PDF) — content là text/markdown với heading #/##/###; " +
-      "các đuôi khác (.ts, .py, .json, .txt, .md, v.v.) — ghi text thuần. " +
-      "Dùng khi tạo document, project, code, config, README, v.v.",
-    input_schema: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "Đường dẫn file tương đối trong workspace, ví dụ: 'report.docx', 'data.xlsx', 'src/index.ts'",
-        },
-        content: {
-          type: "string",
-          description: "Nội dung file. Với .docx/.pdf dùng markdown (#, ##, ###). Với .xlsx dùng CSV hoặc JSON array.",
-        },
-      },
-    required: ["path", "content"],
-    },
-  },
-  {
-    name: "glob_search",
-    description:
-      "Liệt kê tất cả các file khớp với mẫu (wildcard pattern) trong thư mục gốc. " +
-      "Dùng khi bạn muốn lấy danh sách tất cả các file có đuôi nhất định, ví dụ: 'src/**/*.ts' để lấy hết code TS.",
-    input_schema: {
-      type: "object",
-      properties: {
-        pattern: {
-          type: "string",
-          description: "Mẫu tìm kiếm (Glob pattern), ví dụ: 'src/**/*.ts', '*.md'",
-        },
-      },
-      required: ["pattern"],
-    },
-  },
-  {
-    name: "grep_search",
-    description:
-      "Sử dụng công cụ RipGrep Native để tìm kiếm text chính xác hoặc RegEx trong hàng loạt các file với tốc độ siêu nhanh. " +
-      "Sử dụng công cụ này thay vì dùng run_bash với grep nếu bạn muốn rà soát code trên hệ thống.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description: "Từ khóa hoặc đoạn text cần tìm (Regex cũng được).",
-        },
-        dir: {
-          type: "string",
-          description: "Thư mục để khoanh vùng quét (Tương đối so với workspace), ví dụ: 'src'. Mặc định quét tất cả '.'",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "replace_in_file",
-    description:
-      "Sửa điểm (Surgical edit) nội dung trên một file bằng cách tìm `target_content` và thay bằng `replacement_content`.",
-    input_schema: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        target_content: { type: "string" },
-        replacement_content: { type: "string" },
-      },
-      required: ["path", "target_content", "replacement_content"],
-    },
-  },
-  {
-    name: "append_to_file",
-    description:
-      "Nối thêm nội dung vào cuối tệp tin văn bản (text/markdown/code). Dùng riêng cho Chunking Workflow để viết các văn bản khổng lồ.",
-    input_schema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Đường dẫn file (VD: nhap.md)" },
-        content: { type: "string", description: "Nội dung cần nối thêm" },
-      },
-      required: ["path", "content"],
-    },
-  },
-  {
-    name: "compile_file",
-    description:
-      "Biên dịch file nguồn (như .md, .csv) thành file đích như .docx, .pdf, .xlsx. " +
-      "Dùng riêng trong Chunking Workflow để tổng hợp file cuối cùng giao cho user mà không vi phạm Token Limit.",
-    input_schema: {
-      type: "object",
-      properties: {
-        source_path: { type: "string", description: "File nguồn, VD: bai_luan.md" },
-        target_path: { type: "string", description: "File đích, VD: bai_luan.docx" },
-      },
-      required: ["source_path", "target_path"],
-    },
-  },
-  {
-    name: "list_dir",
-    description:
-      "Liệt kê nội dung thư mục trong workspace. Dùng để xem cấu trúc project.",
-    input_schema: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description: "Đường dẫn thư mục tương đối, mặc định là '.' (root workspace)",
-        },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "export_chat",
-    description:
-      "Export the current chat history as a Markdown file and send it to the user. Use when the user asks to export, save, or download the conversation.",
-    input_schema: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "reset_session",
-    description:
-      "Clear the chat history and start a fresh conversation. Use when the user asks to reset, clear history, or start over.",
-    input_schema: {
-      type: "object",
-      properties: {},
-      required: [],
-    },
-  },
-  {
-    name: "browser_action",
-    description: "Điều khiển trình duyệt ảo (Headless). Hỗ trợ điều hướng, click, gõ text, trích xuất text, chụp ảnh và chạy JS. LƯU Ý: Khi gọi screenshot hoặc element_screenshot, ẢNH ĐƯỢC CHỤP SẼ TỰ ĐỘNG GỬI TRỰC TIẾP QUA TELEGRAM CHO USER.",
-    input_schema: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: ["goto", "click", "type", "scroll", "extract_text", "screenshot", "element_screenshot", "evaluate", "download", "extract_image", "upload", "extract_gemini_thought"],
-          description: "Hành động cần thực thi."
-        },
-        target: {
-          type: "string",
-          description: "URL (dành cho goto), CSS Selector (dành cho click/type), hoặc JS Code (dành cho evaluate)."
-        },
-        value: {
-          type: "string",
-          description: "Text cần gõ (dành cho type) hoặc 'up'/'down' (dành cho scroll)."
-        }
-      },
-      required: ["action"]
-    }
-  },
-  {
-    name: "manage_tasks",
-    description: "Quản lý Bảng Checklist trên Telegram. Dùng CREATE để khởi tạo danh sách các công việc sẽ làm. Dùng UPDATE để cập nhật trạng thái khi tiến hành từng bước. LUÔN LUÔN tạo Checklist cho các tác vụ thay đổi mã nguồn phức tạp hơn 2 bước.",
-    input_schema: {
-      type: "object",
-      properties: {
-        action: {
-          type: "string",
-          enum: ["create", "update"],
-          description: "Tạo mới hoặc Cập nhật."
-        },
-        tasks: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              title: { type: "string" },
-              status: { type: "string", enum: ["pending", "doing", "done", "error"] },
-              error_msg: { type: "string" }
-            },
-            required: ["id", "title", "status"]
-          },
-          description: "Mảng danh sách task. Khi UPDATE chỉ cần truyền những task cần update (cùng ID)."
-        }
-      },
-      required: ["action", "tasks"]
-    }
-  },
-  {
-    name: "generate_image",
-    description: "Vẽ ảnh bằng AI. Ảnh sẽ được tự động vẽ và tự động gửi trực tiếp vào phòng chat Telegram của User luôn. LƯU Ý: AI model vẽ ảnh giao tiếp tốt nhất bằng tiếng Anh, nên bạn luôn luôn phải DỊCH Prompt sang tiếng Anh, có thể phóng tác thêm các chi tiết nghệ thuật (lighting, style, 8k resolution, cinematic) để hình ảnh sinh ra rực rỡ và đẹp mắt nhất có thể.",
-    input_schema: {
-      type: "object",
-      properties: {
-        prompt: {
-          type: "string",
-          description: "Mô tả chi tiết bức ảnh mong muốn (BẰNG TIẾNG ANH)."
-        }
-      },
-      required: ["prompt"]
-    }
-  }
-];
+// Tools dynamically loaded via SkillManager
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -464,11 +130,14 @@ export async function handleInbound(
   };
 
   // Ensure dynamic skills are loaded
-  await ensureLoaded();
+  await ensureSkillsLoaded();
 
   // Tool executor
+  const skContext = { msg, sendProgress };
+  const baseToolHandler = skillManager.createToolHandler(deps, skContext);
+  
   const toolHandler: ToolHandler = {
-    tools: [...TOOLS, ...loader.getDefinitions()],
+    tools: baseToolHandler.tools,
     execute: async (name, input): Promise<string> => {
       const pingInterval = setInterval(() => {
         if (keepAliveCallback) keepAliveCallback();
@@ -476,7 +145,6 @@ export async function handleInbound(
 
       try {
         const i = input as Record<string, string>;
-
         const hookCtx = {
           chatId: msg.chatId,
           userId: msg.userId,
@@ -485,298 +153,16 @@ export async function handleInbound(
           historySize: history.length,
         };
       
-      const hookRes = await hookRegistry.runPreToolUse(hookCtx, name, i);
-      if (!hookRes.allowed) {
-        return hookRes.reason ?? "Execution blocked by hook.";
-      }
-
-      switch (name) {
-        case "create_reminder": {
-          if (!cronManager) return "Reminder feature is not available.";
-          await sendProgress(`Đang tạo lịch nhắc...`);
-          const job = cronManager.add(msg.chatId, msg.userId, i.cron_expression, i.message);
-          if (job) {
-            return `Reminder created. ID: ${job.id.slice(-6)}. Schedule: "${i.cron_expression}". Message: "${i.message}"`;
-          }
-          return `Failed to create reminder. Invalid cron expression: "${i.cron_expression}"`;
+        const hookRes = await hookRegistry.runPreToolUse(hookCtx, name, i);
+        if (!hookRes.allowed) {
+          return hookRes.reason ?? "Execution blocked by hook.";
         }
 
-        case "list_reminders": {
-          if (!cronManager) return "Reminder feature is not available.";
-          await sendProgress(`Đang lấy danh sách công việc...`);
-          const jobs = cronManager.list(msg.chatId);
-          if (jobs.length === 0) return "No active reminders found for this chat.";
-          return "Active reminders:\n" + jobs.map((j) => `- ID: ${j.id.slice(-6)} | Cron: ${j.expression} | Msg: ${j.prompt}`).join("\n");
-        }
-
-        case "delete_reminder": {
-          if (!cronManager) return "Reminder feature is not available.";
-          const id = i.id ?? "";
-          if (!id) return "Error: Missing reminder ID.";
-          await sendProgress(`Đang xóa công việc ID ${id}...`);
-          
-          const jobs = cronManager.list(msg.chatId);
-          const target = jobs.find((j) => j.id === id || j.id.endsWith(id));
-          if (!target) return `Error: Reminder ID "${id}" not found.`;
-          
-          const success = cronManager.delete(msg.chatId, target.id);
-          return success ? `Reminder ${target.id.slice(-6)} deleted successfully.` : `Failed to delete reminder ${id}.`;
-        }
-
-
-
-        case "run_bash": {
-          const command = i.command ?? "";
-          await sendProgress(`Đang chạy: \`${command.slice(0, 80)}\``);
-          return await runBash(command, config.bashTimeoutMs, config.workspaceDir);
-        }
-
-        case "fetch_url":
-          await sendProgress(`Đang đọc: ${(i.url ?? "").slice(0, 60)}...`);
-          return await fetchUrl(i.url ?? "");
-
-        case "web_search":
-          await sendProgress(`Đang tìm kiếm: "${i.query ?? ""}"`);
-          return await webSearch(i.query ?? "");
-
-        case "glob_search": {
-          const { executeGlob } = await import("../plugins/search.js");
-          return await executeGlob(config.workspaceDir, i.pattern as string);
-        }
-
-        case "grep_search": {
-          const { executeGrep } = await import("../plugins/search.js");
-          return await executeGrep(config.workspaceDir, i.query as string, i.dir || ".");
-        }
-
-        case "memory_search":
-          await sendProgress(`Đang tìm trong memory: "${i.query ?? ""}"`);
-          return await searchMemory(i.query ?? "", memoriesDir);
-
-        case "read_file":
-          await sendProgress(`Đang đọc file: ${i.path ?? ""}`);
-          return readFile(config.workspaceDir, i.path ?? "");
-
-        case "write_file": {
-          const filePath = i.path ?? "";
-          await sendProgress(`Đang tạo file: ${filePath}`);
-          const result = await writeFile(config.workspaceDir, filePath, i.content ?? "");
-          if (result.startsWith("✅")) {
-            if (channel.sendFileBuffer) {
-              try {
-                const resolvedPath = path.resolve(config.workspaceDir, filePath);
-                const fileBuffer = (await import("node:fs")).readFileSync(resolvedPath);
-                const filename = path.basename(filePath);
-                await channel.sendFileBuffer(msg.chatId, fileBuffer, filename);
-              } catch { }
-            }
-            // KIỂM DUYỆT TRỌNG TÀI (Chỉ áp dụng cho source code, không áp dụng cho văn bản)
-            const ext = path.extname(filePath).toLowerCase();
-            const isCodeFile = [".ts", ".js", ".py", ".go", ".java", ".cpp", ".c", ".rs", ".php"].includes(ext);
-            
-            if (isCodeFile) {
-              try {
-                 const { CodeVerifier } = await import("../ai/verifier.js");
-                 const verifier = new CodeVerifier(browserManager, sendProgress);
-                 const fullPath = path.resolve(config.workspaceDir, filePath);
-                 const content = (await import("node:fs")).readFileSync(fullPath, "utf-8");
-                 const vResult = await verifier.verifyFile(filePath, content);
-                 if (!vResult.isOk) {
-                   return `Lệnh GHI FILE MÃ NGUỒN VẬT LÝ đã thành công, NHƯNG HỆ THỐNG TRỌNG TÀI KIỂM DUYỆT BÁO LỖI. \nLỗi: ${vResult.error}\n\n-> YÊU CẦU AGENT TỰ ĐỘNG PHÂN TÍCH LẠI LỖI VÀ GỌI LỆNH SỬA CHỮA NGAY LẬP TỨC TRONG LƯỢT NÀY!`;
-                 }
-              } catch (e) {
-                 console.error("[Verifier Error]", e);
-              }
-            }
-          }
-          return result;
-        }
-
-        case "replace_in_file": {
-          const filePath = i.path ?? "";
-          const target = i.target_content ?? "";
-          const replacement = i.replacement_content ?? "";
-          await sendProgress(`Đang sửa đổi file: ${filePath}`);
-          const { replaceInFile } = await import("../plugins/fileio.js");
-          const result = await replaceInFile(config.workspaceDir, filePath, target, replacement);
-          if (result.startsWith("✅")) {
-            // KIỂM DUYỆT TRỌNG TÀI
-            const ext = path.extname(filePath).toLowerCase();
-            const isCodeFile = [".ts", ".js", ".py", ".go", ".java", ".cpp", ".c", ".rs", ".php"].includes(ext);
-            
-            if (isCodeFile) {
-              try {
-                 const { CodeVerifier } = await import("../ai/verifier.js");
-                 const verifier = new CodeVerifier(browserManager, sendProgress);
-                 const fullPath = path.resolve(config.workspaceDir, filePath);
-                 const content = (await import("node:fs")).readFileSync(fullPath, "utf-8");
-                 const vResult = await verifier.verifyFile(filePath, content);
-                 if (!vResult.isOk) {
-                   return `Lệnh SỬA FILE MÃ NGUỒN VẬT LÝ đã thành công, NHƯNG HỆ THỐNG TRỌNG TÀI KIỂM DUYỆT BÁO LỖI. \nLỗi: ${vResult.error}\n\n-> YÊU CẦU AGENT TỰ ĐỘNG PHÂN TÍCH LẠI LỖI VÀ GỌI LỆNH SỬA CHỮA NGAY LẬP TỨC TRONG LƯỢT NÀY!`;
-                 }
-              } catch (e) {
-                 console.error("[Verifier Error]", e);
-              }
-            }
-          }
-          return result;
-        }
-
-        case "append_to_file": {
-          const filePath = i.path ?? "";
-          const content = i.content ?? "";
-          await sendProgress(`Đang viết tiếp vào file: ${filePath}`);
-          const { appendToFile } = await import("../plugins/fileio.js");
-          return appendToFile(config.workspaceDir, filePath, content);
-        }
-
-        case "compile_file": {
-          const sourcePath = i.source_path ?? "";
-          const targetPath = i.target_path ?? "";
-          await sendProgress(`Đang biên dịch ${sourcePath} -> ${targetPath}...`);
-          const { compileFile } = await import("../plugins/fileio.js");
-          const result = await compileFile(config.workspaceDir, sourcePath, targetPath);
-          
-          if (result.startsWith("✅") && channel.sendFileBuffer) {
-            try {
-              const fs = await import("node:fs");
-              const resolvedTarget = path.resolve(config.workspaceDir, targetPath);
-              const fileBuffer = fs.readFileSync(resolvedTarget);
-              const filename = path.basename(targetPath);
-              await channel.sendFileBuffer(msg.chatId, fileBuffer, filename);
-            } catch {
-              // Ignore sending errors
-            }
-          }
-          return result;
-        }
-
-        case "list_dir":
-          await sendProgress(`Đang xem thư mục: ${i.path ?? "."}`);
-          return listDir(config.workspaceDir, i.path ?? ".");
-
-        case "export_chat": {
-          const turns = sessionManager.getHistory(sessionKey);
-          if (turns.length === 0) return "No chat history to export.";
-          const content = buildExportMarkdown(sessionKey, turns);
-          const filename = `chat-export-${Date.now()}.md`;
-          await channel.sendDocument?.(msg.chatId, content, filename, "📄 Chat history");
-          return `Chat history exported (${turns.length} turns).`;
-        }
-
-        case "reset_session": {
-          sessionManager.reset(sessionKey);
-          // Xóa tệp tạm tải lên (Img2Img) của người dùng hiện tại
-          try {
-             const fs = await import("node:fs");
-             const path = await import("node:path");
-             const tmpDir = path.resolve("./data/tmp");
-             if (fs.existsSync(tmpDir)) {
-               const files = fs.readdirSync(tmpDir);
-               for (const file of files) {
-                  if (file.startsWith(`upload_${msg.chatId}_`)) {
-                     fs.unlinkSync(path.join(tmpDir, file));
-                  }
-               }
-             }
-          } catch (e) {
-             console.error("[telegram] Failed to cleanup tmp files on reset", e);
-          }
-          return "Chat history cleared. Bất kỳ file tạm nào bạn đã tải lên cũng đã được xóa rác thành công.";
-        }
-
-        case "browser_action": {
-          const action = i.action ?? "";
-          const target = i.target ?? undefined;
-          const value = i.value ?? undefined;
-          
-          await sendProgress(`Đang điều khiển trình duyệt: ${action} ${target || ''}`.trim());
-          const result = await browserManager.executeAction(action, target, value);
-          
-          if (Buffer.isBuffer(result)) {
-            // Nhận diện mã lõi Magic Bytes xem có phải tập tin hình ảnh không
-            const isImage = result.length > 4 && (
-              (result[0] === 0xFF && result[1] === 0xD8) || // JPEG
-              (result[0] === 0x89 && result[1] === 0x50 && result[2] === 0x4E && result[3] === 0x47) || // PNG
-              (result[0] === 0x47 && result[1] === 0x49 && result[2] === 0x46) || // GIF
-              (result[0] === 0x52 && result[1] === 0x49 && result[2] === 0x46 && result[3] === 0x46) // WEBP
-            );
-
-            if (isImage) {
-              await channel.sendPhoto?.(msg.chatId, result, undefined);
-              return "Đã chụp/tải ảnh màn hình và gửi thành công.";
-            } else {
-               // Nếu là file tải về nhưng không phải ảnh (VD PDF, ZIP, code) => Gửi nhét kèm
-              await channel.sendFileBuffer?.(msg.chatId, result, `downloaded_file_${Date.now()}.bin`, "Đã tải xuống thành công.");
-              return "Đã tải tập tin và gửi nguyên gốc file cho người dùng thành công.";
-            }
-          }
-          return result;
-        }
-
-        case "generate_image": {
-          const prompt = encodeURIComponent(i.prompt ?? "A aesthetic artwork");
-          const url = `https://image.pollinations.ai/prompt/${prompt}?width=1024&height=1024&nologo=true&seed=${Math.floor(Math.random() * 100000)}`;
-          
-          await sendProgress(`Đang gọi vệ tinh không gian vẽ ảnh: ${i.prompt}...`);
-          try {
-            const resp = await fetch(url);
-            if (!resp.ok) return `Lỗi báo từ máy chủ vẽ: HTTP ${resp.status}`;
-            const buf = await resp.arrayBuffer();
-            const nodeBuf = Buffer.from(buf);
-            
-            if (channel.sendPhoto) {
-              await channel.sendPhoto(msg.chatId, nodeBuf, `🖌 **Prompt:** ${i.prompt}`);
-              return `Ảnh đã vẽ xong và gửi cho user qua Telegram!`;
-            }
-            return `Lỗi hệ thống: Kênh Telegram không bắt được phương thức gửi ảnh.`;
-          } catch(e) {
-             return `Lỗi nội bộ khi tải ảnh: ${e instanceof Error ? e.message : String(e)}`;
-          }
-        }
-
-        case "manage_tasks": {
-          const action = i.action as string;
-          const tasks = i.tasks as unknown as any[];
-          
-          if (action === "create") {
-            taskManager.setTasks(msg.chatId, tasks);
-          } else if (action === "update") {
-            for (const t of tasks) {
-              taskManager.updateTask(msg.chatId, t.id, t.status, t.error_msg);
-            }
-          }
-          
-          const markdown = taskManager.buildMarkdown(msg.chatId);
-          // Gửi tin nhắn hoặc thay thế tin nhắn cũ
-          const oldMsgId = taskManager.getMessageId(msg.chatId);
-          
-          const sentId = await channel.send({
-             channel: msg.channel,
-             chatId: msg.chatId,
-             text: markdown,
-             editMessageId: oldMsgId,
-             isFinal: false
-          });
-          
-          if (sentId) {
-             taskManager.setMessageId(msg.chatId, sentId);
-          }
-          
-          return "Đã đồng bộ Checklist lên Telegram thành công.";
-        }
-
-        default: {
-          if (loader.getDefinitions().some(s => s.name === name)) {
-             return await loader.executeSkill(name, i, deps);
-          }
-          return `Unknown tool: ${name}`;
-        }
-      }
+        return await baseToolHandler.execute(name, input);
       } finally {
         clearInterval(pingInterval);
       }
-    },
+    }
   };
 
   // ─── Load soul/user/memory files ────────────────────────────────────────────
@@ -961,20 +347,3 @@ function shouldRequireApproval(command: string, mode: Config["bashApprovalMode"]
   return isDangerous(command);
 }
 
-function buildExportMarkdown(key: string, turns: { role: string; content: unknown }[]): string {
-  const lines = [
-    `# Chat Export`,
-    `**Session:** ${key}`,
-    `**Exported:** ${new Date().toISOString()}`,
-    `**Turns:** ${turns.length}`,
-    ``,
-    `---`,
-    ``,
-  ];
-  for (const t of turns) {
-    const role = t.role === "user" ? "👤 User" : "🤖 Gemma";
-    const content = typeof t.content === "string" ? t.content : JSON.stringify(t.content);
-    lines.push(`### ${role}\n\n${content}\n`);
-  }
-  return lines.join("\n");
-}

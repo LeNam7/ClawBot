@@ -6,12 +6,20 @@ import type { AIClient, AIRequest, AIStreamEvent, ToolDefinition } from "./types
  * Ollama: đặt OPENAI_BASE_URL=http://localhost:11434/v1 và OPENAI_API_KEY=ollama
  */
 export class OpenAIClient implements AIClient {
-  private client: OpenAI;
+  private baseKeys: string[];
+  private baseUrl?: string;
+  private currentKeyIndex: number = 0;
 
   constructor(apiKey: string, baseUrl?: string) {
-    this.client = new OpenAI({
-      apiKey: apiKey || "ollama",
-      baseURL: baseUrl,
+    this.baseKeys = apiKey ? apiKey.split(",").map(k => k.trim()).filter(Boolean) : ["ollama"];
+    if (this.baseKeys.length === 0) this.baseKeys = ["ollama"];
+    this.baseUrl = baseUrl;
+  }
+
+  private getClient(): OpenAI {
+    return new OpenAI({
+      apiKey: this.baseKeys[this.currentKeyIndex],
+      baseURL: this.baseUrl,
     });
   }
 
@@ -34,20 +42,32 @@ export class OpenAIClient implements AIClient {
 
         let stream;
         let attempt = 0;
-        const MAX_RETRIES = 5;
+        const MAX_RETRIES = this.baseKeys.length > 1 ? this.baseKeys.length * 2 : 5; // Rotate through all keys twice if needed
         while (attempt < MAX_RETRIES) {
           try {
-            stream = await this.client.chat.completions.create(params, {
+            const client = this.getClient();
+            stream = await client.chat.completions.create(params, {
               signal: req.signal,
             });
             break;
           } catch (err: any) {
             if (err.status === 429 || err?.message?.includes("429")) {
               attempt++;
-              const backoff = attempt * 10000; // Đợi 10s, 20s, 30s...
-              console.log(`[openai-client] Bị chặn API Rate Limit 429. Chờ ${backoff/1000}s trước khi thử lại (Lần ${attempt}/${MAX_RETRIES})...`);
-              yield { type: "delta", delta: `\n\n_...Đang chờ ${backoff/1000}s vì bị giới hạn API..._\n`, fullText: fullText };
-              await new Promise(r => setTimeout(r, backoff));
+              if (this.baseKeys.length > 1) {
+                 // Rotate key immediately and retry
+                 this.currentKeyIndex = (this.currentKeyIndex + 1) % this.baseKeys.length;
+                 console.log(`[openai-client] Rate Limit 429. Rotating to key index ${this.currentKeyIndex} (Attempt ${attempt}/${MAX_RETRIES})`);
+                 yield { type: "delta", delta: `\n\n_...Đang đổi API Key phụ (Lần ${attempt})..._\n`, fullText: fullText + `\n\n_...Đang đổi API Key phụ (Lần ${attempt})..._\n` };
+                 // Nho wait môt chút cho chắc ăn
+                 await new Promise(r => setTimeout(r, 1000));
+              } else {
+                 const backoff = attempt * 10000; // Đợi 10s, 20s, 30s...
+                 console.log(`[openai-client] Bị chặn API Rate Limit 429. Chờ ${backoff/1000}s trước khi thử lại (Lần ${attempt}/${MAX_RETRIES})...`);
+                 // Fix: Cập nhật fullText với thông báo chờ để UI hiển thị được
+                 const tempFullText = fullText + `\n\n_...Đang chờ ${backoff/1000}s vì bị giới hạn API..._\n`;
+                 yield { type: "delta", delta: `\n\n_...Đang chờ ${backoff/1000}s vì bị giới hạn API..._\n`, fullText: tempFullText };
+                 await new Promise(r => setTimeout(r, backoff));
+              }
             } else {
               throw err;
             }

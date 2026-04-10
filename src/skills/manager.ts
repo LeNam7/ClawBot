@@ -1,16 +1,21 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ToolDefinition, ToolHandler } from "../ai/types.js";
 import type { HandlerDeps } from "../pipeline/handler.js";
+import type { InboundMessage } from "../core/types.js";
+
+export interface SkillContext {
+  msg: InboundMessage;
+  sendProgress: (text?: string) => Promise<void>;
+}
 
 /**
  * Interface cho một Skill (Tool) được định nghĩa trong file riêng biệt.
  * Mỗi file trong /src/skills/ phải export default một object thỏa mãn interface này.
  */
 export interface Skill extends ToolDefinition {
-  /** Logic thực thi của skill. Nhận vào các tham số đã parse và deps của bot. */
-  execute: (args: any, deps: HandlerDeps) => Promise<string>;
+  /** Logic thực thi của skill. Nhận vào các tham số đã parse, deps của hệ thống, và context của tin nhắn. */
+  execute: (args: any, deps: HandlerDeps, ctx: SkillContext) => Promise<string>;
 }
 
 export class SkillManager {
@@ -18,36 +23,25 @@ export class SkillManager {
   private readonly skillsDir: string;
 
   constructor(baseDir: string) {
-    // Giả định baseDir là thư mục gốc của project, skills nằm trong src/skills
     this.skillsDir = path.join(baseDir, "src", "skills");
   }
 
-  /**
-   * Quét thư mục skills và load tất cả các file .ts hoặc .js
-   */
   async loadSkills(): Promise<void> {
     console.log(`[skill-manager] scanning directory: ${this.skillsDir}`);
     
     try {
-      // Đảm bảo thư mục tồn tại
       await fs.mkdir(this.skillsDir, { recursive: true });
       
       const files = await fs.readdir(this.skillsDir);
       const skillFiles = files.filter(f => f.endsWith(".ts") || f.endsWith(".js"));
 
-      console.log(`[skill-manager] found ${skillFiles.length} skill files.`);
-
       for (const file of skillFiles) {
         if (file === "manager.ts" || file === "manager.js" || file === "types.ts") continue;
 
         const filePath = path.join(this.skillsDir, file);
-        // Chuyển path thành file URL để import động hoạt động ổn định trên cả Windows/Linux
-        const fileUrl = path.toNamespacedPath(filePath); 
-        // Lưu ý: Với Node.js ESM, dùng file:// protocol là chuẩn nhất
         const importUrl = `file://${filePath.replace(/\\/g, '/')}`;
 
         try {
-          // @ts-ignore - dynamic import của TS có thể báo lỗi nếu không có type declaration
           const module = await import(importUrl);
           const skill = module.default as Skill;
 
@@ -67,56 +61,27 @@ export class SkillManager {
     }
   }
 
-  /**
-   * Trả về ToolHandler để truyền vào AIClient
-   */
-  getToolHandler(): ToolHandler {
-    return {
-      tools: Array.from(this.skills.values()).map(s => ({
-        name: s.name,
-        description: s.description,
-        input_schema: s.input_schema
-      })),
-      execute: async (name: string, input: unknown) => {
-        const skill = this.skills.get(name);
-        if (!skill) {
-          throw new Error(`Skill "${name}" not found.`);
-        }
-        
-        // Lưu ý: Ở đây mình cần deps. 
-        // Nhưng getToolHandler() chưa nhận deps. 
-        // Giải pháp: Truyền deps vào execute của ToolHandler lúc runtime trong handleInbound.
-        // Tuy nhiên interface ToolHandler hiện tại của AIClient là:
-        // execute: (name: string, input: unknown) => Promise<string>;
-        // Nó KHÔNG nhận deps. 
-        // => Mình sẽ dùng một trick: SkillManager sẽ lưu trữ deps sau khi khởi tạo.
-        throw new Error("SkillManager.getToolHandler() must be called with deps or SkillManager must be initialized with deps.");
-      }
-    };
-  }
+  createToolHandler(deps: HandlerDeps, ctx: SkillContext): ToolHandler {
+    const localTools = Array.from(this.skills.values()).map(s => ({
+      name: s.name,
+      description: s.description,
+      input_schema: s.input_schema
+    }));
 
-  /**
-   * Cách tiếp cận tốt hơn: Trả về một ToolHandler đã được bind sẵn với deps.
-   */
-  getToolHandlerWithDeps(deps: HandlerDeps): ToolHandler {
     return {
-      tools: Array.from(this.skills.values()).map(s => ({
-        name: s.name,
-        description: s.description,
-        input_schema: s.input_schema
-      })),
+      tools: localTools,
       execute: async (name: string, input: unknown) => {
         const skill = this.skills.get(name);
-        if (!skill) {
-          throw new Error(`Skill "${name}" not found.`);
+        if (skill) {
+          try {
+            return await skill.execute(input as any, deps, ctx);
+          } catch (err: any) {
+            console.error(`[skill-manager] error executing skill "${name}":`, err);
+            return `Lỗi thực thi kỹ năng "${name}": ${err.message}`;
+          }
         }
-        try {
-          // Gọi skill với input đã được parse và deps
-          return await skill.execute(input as any, deps);
-        } catch (err: any) {
-          console.error(`[skill-manager] error executing skill "${name}":`, err);
-          return `Error executing skill "${name}": ${err.message}`;
-        }
+
+        throw new Error(`Skill "${name}" not found.`);
       }
     };
   }

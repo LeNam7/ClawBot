@@ -6,7 +6,7 @@ import { createAIClient } from "./ai/factory.js";
 import { ChannelRegistry } from "./channels/registry.js";
 import { TelegramChannel } from "./channels/telegram/index.js";
 import { CLIChannel } from "./channels/cli/index.js";
-import { handleInbound } from "./pipeline/handler.js";
+import { handleInbound, ensureSkillsLoaded } from "./pipeline/handler.js";
 import type { HandlerDeps } from "./pipeline/handler.js";
 import { createServer } from "./gateway/server.js";
 import { CronManager } from "./plugins/cron.js";
@@ -106,6 +106,8 @@ async function main() {
   // 8. Start channels
   const startPromises = registry.getAll().map(c => c.start());
   await Promise.all(startPromises);
+  
+  ensureSkillsLoaded().catch(e => console.log("[MCP] Boot background failed:", e));
 
   const server = await createServer(config.gatewayPort);
 
