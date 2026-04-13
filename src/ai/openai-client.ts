@@ -56,10 +56,18 @@ export class OpenAIClient implements AIClient {
               if (this.baseKeys.length > 1) {
                  // Rotate key immediately and retry
                  this.currentKeyIndex = (this.currentKeyIndex + 1) % this.baseKeys.length;
-                 console.log(`[openai-client] Rate Limit 429. Rotating to key index ${this.currentKeyIndex} (Attempt ${attempt}/${MAX_RETRIES})`);
-                 yield { type: "delta", delta: `\n\n_...Đang đổi API Key phụ (Lần ${attempt})..._\n`, fullText: fullText + `\n\n_...Đang đổi API Key phụ (Lần ${attempt})..._\n` };
-                 // Nho wait môt chút cho chắc ăn
-                 await new Promise(r => setTimeout(r, 1000));
+                 let waitTime = 1000;
+                 if (attempt > this.baseKeys.length) {
+                   waitTime = (attempt - this.baseKeys.length) * 10000; // Đợi 10s, 20s... nếu đã thử hết mọi key mà vẫn toang
+                 }
+                 console.log(`[openai-client] Rate Limit 429. Rotating to key index ${this.currentKeyIndex}. Chờ ${waitTime/1000}s (Attempt ${attempt}/${MAX_RETRIES})`);
+                 
+                 const msgSuffix = waitTime > 1000 ? ` (Chờ ${waitTime/1000}s vì mọi Key đều nghẽn)..._\n` : `...\n`;
+                 const deltaText = `\n\n_...Đang đổi API Key phụ (Lần ${attempt})` + msgSuffix;
+                 
+                 fullText += deltaText;
+                 yield { type: "delta", delta: deltaText, fullText: fullText };
+                 await new Promise(r => setTimeout(r, waitTime));
               } else {
                  const backoff = attempt * 10000; // Đợi 10s, 20s, 30s...
                  console.log(`[openai-client] Bị chặn API Rate Limit 429. Chờ ${backoff/1000}s trước khi thử lại (Lần ${attempt}/${MAX_RETRIES})...`);

@@ -182,9 +182,9 @@ export async function handleInbound(
   const userContent = safeReadTrimmed(path.join(dataDir, "user.md"), 800);
   const memoryContent = safeReadTrimmed(path.join(dataDir, "memory.md"), 1200);
 
-  const soulBlock = soulContent ? `\n\n---\n${soulContent}` : "";
-  const userBlock = userContent ? `\n\n---\n${userContent}` : "";
-  const memoryBlock = memoryContent ? `\n\n---\n[MEMORY - ĐỌC TRƯỚC KHI TRẢ LỜI]\n${memoryContent}` : "";
+  const soulBlock = soulContent ? `\n<bot_soul>\n${soulContent}\n</bot_soul>` : "";
+  const userBlock = userContent ? `\n<user_context>\n${userContent}\n</user_context>` : "";
+  const memoryBlock = memoryContent ? `\n<working_memory>\n[MEMORY]\n${memoryContent}\n</working_memory>` : "";
 
   // Thay thế hardcoded dynamicContext bằng luồng SessionStart Hooks
   const hookCtx = {
@@ -195,7 +195,7 @@ export async function handleInbound(
     historySize: history.length,
   };
   const dynamicContextText = await hookRegistry.runSessionStart(hookCtx);
-  const dynamicContext = dynamicContextText ? `\n\n${dynamicContextText}` : "";
+  const dynamicContext = dynamicContextText ? `\n<dynamic_context>\n${dynamicContextText}\n</dynamic_context>` : "";
 
   // ─── Model routing — tự chọn model theo độ phức tạp ─────────────────────
   const complexity = classifyComplexity(msg.text, history);
