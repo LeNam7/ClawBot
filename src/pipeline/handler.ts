@@ -71,6 +71,7 @@ export interface HandlerDeps {
   cronManager?: CronManager;
   browserManager: BrowserManager;
   contextManager?: ContextManager;
+  compressor?: any;
 }
 
 // ─── Main handler ─────────────────────────────────────────────────────────────

@@ -16,6 +16,10 @@ export class SessionManager {
     return `${channel}:${userId}:${chatId}`;
   }
 
+  getStore() {
+    return this.store;
+  }
+
   getOrCreate(channel: string, userId: string, chatId: string) {
     const key = this.makeKey(channel, userId, chatId);
     const existing = this.store.getSession(key);

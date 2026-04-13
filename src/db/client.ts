@@ -69,6 +69,17 @@ export class JsonStore {
     this.scheduleSave();
   }
 
+  replaceTurnsWithSummary(key: SessionKey, countToRemove: number, summaryTurn: ConversationTurn) {
+    const session = this.store.sessions[key];
+    if (!session) return;
+    // Bỏ đi N turns đầu tiên (lịch sử cũ)
+    session.turns.splice(0, countToRemove);
+    // Nhét câu trả lời Tóm Tắt (Ký ức nén) vào vị trí đầu tiên
+    session.turns.unshift(summaryTurn);
+    session.updatedAt = new Date().toISOString();
+    this.scheduleSave();
+  }
+
   deleteTurns(key: SessionKey) {
     const session = this.store.sessions[key];
     if (!session) return;

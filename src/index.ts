@@ -38,6 +38,10 @@ async function main() {
   // 4. Security & Channels
   const securityManager = new SecurityManager();
   const registry = new ChannelRegistry();
+  
+  // 4.1 Compressor
+  const { SessionCompressor } = await import("./session/compressor.js");
+  const compressor = new SessionCompressor(sessionManager, config.compressThresholdTokens);
 
   if (config.telegramBotToken) {
     const telegram = new TelegramChannel(
@@ -63,6 +67,7 @@ async function main() {
     config,
     browserManager,
     contextManager,
+    compressor,
   };
   
   // Gắn event onMessage chung cho tất cả channel

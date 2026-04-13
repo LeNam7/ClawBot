@@ -20,6 +20,10 @@ export class SessionStore {
     this.db.appendTurn(key, turn);
   }
 
+  replaceTurnsWithSummary(key: SessionKey, countToRemove: number, summaryTurn: ConversationTurn) {
+    this.db.replaceTurnsWithSummary(key, countToRemove, summaryTurn);
+  }
+
   deleteTurns(key: SessionKey) {
     this.db.deleteTurns(key);
   }

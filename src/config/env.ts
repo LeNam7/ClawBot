@@ -39,6 +39,8 @@ const schema = z.object({
   // Token budget cho context: Model Gemma 4 (trên Google Studio) hỗ trợ ~1M tokens. Nâng budget lên cực đại!
   // Mặc định 250k tokens (tương đương 1 triệu ký tự)
   MAX_CONTEXT_TOKENS: z.coerce.number().default(250000),
+  // Ngưỡng báo động để chích nén (mặc định 200k tokens = 80%)
+  COMPRESS_THRESHOLD_TOKENS: z.coerce.number().default(200000),
 
   // ── Access control ────────────────────────────────────────────────────────
   ALLOWED_USER_IDS: z.string().default(""),
@@ -158,6 +160,7 @@ export const config = {
   // History / Context
   maxHistoryTurns: parsed.data.MAX_HISTORY_TURNS,
   maxContextTokens: parsed.data.MAX_CONTEXT_TOKENS,
+  compressThresholdTokens: parsed.data.COMPRESS_THRESHOLD_TOKENS,
 
   // Access
   allowedUserIds: parsed.data.ALLOWED_USER_IDS
