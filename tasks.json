@@ -1,0 +1,23 @@
+[
+  {
+    "id": "task_1776350774699",
+    "title": "[PROACTIVE]: Hỗ trợ chọn Niche TikTok Shop",
+    "description": "Nhắc NT777 thực hiện bước chọn 1 Niche tiềm năng từ báo cáo TikTok và hỗ trợ phân tích nếu cần.",
+    "next_run_time": "2026-04-17T09:00:00Z",
+    "status": "done"
+  },
+  {
+    "id": "task_1776350774699",
+    "title": "[PROACTIVE]: Hỗ trợ tìm nhà cung cấp",
+    "description": "Nhắc NT777 tìm kiếm nhà cung cấp cho Niche đã chọn và hỗ trợ tìm nguồn nếu được yêu cầu.",
+    "next_run_time": "2026-04-17T11:00:00Z",
+    "status": "pending"
+  },
+  {
+    "id": "task_1776350774700",
+    "title": "[PROACTIVE]: Hỗ trợ test Concept Video",
+    "description": "Nhắc NT777 test 3 concept video ngắn và hỗ trợ góp ý kịch bản/concept.",
+    "next_run_time": "2026-04-17T14:00:00Z",
+    "status": "done"
+  }
+]

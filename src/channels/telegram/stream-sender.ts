@@ -70,6 +70,12 @@ export class TelegramStreamSender {
         const result = await this.bot.api.sendMessage(this.chatId, safeText, { parse_mode: "HTML" });
         this.messageId = result.message_id;
         this.lastSentText = text;
+        
+        // Chống Race Condition: Nếu bot đã bị stop/abort trong lúc đang đợi gửi tin nhắn,
+        // thì xóa ngay tin nhắn vừa gửi để tránh rác màn hình.
+        if (this.stopped) {
+           try { await this.bot.api.deleteMessage(this.chatId, this.messageId); } catch {}
+        }
       } catch (e) {
         console.error("[telegram-stream] send err:", e);
       }
@@ -98,7 +104,12 @@ export class TelegramStreamSender {
     }
 
     const finalTxt = this.fullText.trim();
-    if (!finalTxt) return;
+    if (!finalTxt) {
+      if (this.messageId) {
+        try { await this.bot.api.deleteMessage(this.chatId, this.messageId); } catch {}
+      }
+      return;
+    }
 
     const chunks = this.splitMessage(finalTxt);
     
@@ -122,8 +133,10 @@ export class TelegramStreamSender {
           try {
             await this.bot.api.editMessageText(this.chatId, this.messageId, chunk);
           } catch {
-            // Hiếm khi xảy ra, trừ khi file gốc bị user xóa tay
-            await this.bot.api.sendMessage(this.chatId, chunk);
+            // Nếu cả 2 lần edit đều thất bại (do rate limit hoặc lỗi format), ta gửi tin nhắn mới.
+            // BẮT BUỘC PHẢI XÓA tin nhắn nháp cũ đi để tránh tạo ra 2 tin nhắn trên màn hình!
+            try { await this.bot.api.deleteMessage(this.chatId, this.messageId); } catch {}
+            try { await this.bot.api.sendMessage(this.chatId, chunk); } catch(err: any) { console.error("Final Flush Failed:", err.message); }
           }
         }
       } else {
@@ -132,8 +145,8 @@ export class TelegramStreamSender {
         } catch {
           try {
             await this.bot.api.sendMessage(this.chatId, chunk);
-          } catch (err) {
-            console.error("[telegram] send error:", err);
+          } catch (err: any) {
+            console.error("[telegram] send error:", err.message);
           }
         }
       }
@@ -141,14 +154,18 @@ export class TelegramStreamSender {
     }
   }
 
-  async abort(): Promise<void> {
+  async abort(silent: boolean = false): Promise<void> {
     this.stopped = true;
     if (this.flushInterval) clearInterval(this.flushInterval);
     if (this.messageId) {
-       try {
-         const abortedText = (this.fullText.trim() ? this.fullText.trim() + "\n\n" : "") + " *(Đã hủy)*";
-         await this.bot.api.editMessageText(this.chatId, this.messageId, abortedText, { parse_mode: "MarkdownV2" });
-       } catch {}
+       if (silent) {
+         try { await this.bot.api.deleteMessage(this.chatId, this.messageId); } catch {}
+       } else {
+         try {
+           const abortedText = (this.fullText.trim() ? this.fullText.trim() + "\n\n" : "") + " ❌ (Đã hủy)";
+           await this.bot.api.editMessageText(this.chatId, this.messageId, abortedText);
+         } catch {}
+       }
     }
   }
 

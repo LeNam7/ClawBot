@@ -22,7 +22,7 @@ export class SkillLoader {
         // Kỳ vọng mỗi file export default một object tuân thủ ISkill
         const skill = module.default as ISkill;
 
-        if (skill && skill.name && skill.execute) {
+        if (skill && skill.name && typeof skill.execute === 'function') {
           registry[skill.name] = skill;
           console.log(`[skill-loader] loaded: ${skill.name}`);
         } else {

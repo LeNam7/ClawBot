@@ -1,0 +1,28 @@
+{
+  "daily_routines": [
+    {
+      "time": "08:00",
+      "task": "Ban tin sang (Thoi tiet, Vang, Coin, Tin tuc)",
+      "type": "Fixed/Manual",
+      "status": "Sacred"
+    },
+    {
+      "time": "12:00",
+      "task": "Nhac an trua",
+      "type": "Reminder",
+      "id": "779569"
+    },
+    {
+      "time": "18:00",
+      "task": "Report TikTok",
+      "type": "Reminder",
+      "id": "095282"
+    },
+    {
+      "time": "22:30",
+      "task": "Nhac di ngu",
+      "type": "Reminder",
+      "id": "131650"
+    }
+  ]
+}

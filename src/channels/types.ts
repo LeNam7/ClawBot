@@ -3,7 +3,7 @@ import type { InboundMessage, OutboundMessage } from "../core/types.js";
 export interface StreamHandle {
   update(fullText: string): void;
   finalize(): Promise<void>;
-  abort(): Promise<void>;
+  abort(silent?: boolean): Promise<void>;
 }
 
 export interface IChannel {

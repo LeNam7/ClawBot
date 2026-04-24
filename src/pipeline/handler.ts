@@ -3,9 +3,9 @@ import { SkillManager } from "../skills/manager.js";
 const skillManager = new SkillManager(process.cwd());
 let skillsLoaded = false;
 export async function ensureSkillsLoaded() {
-  if (!skillsLoaded) { 
-    await skillManager.loadSkills(); 
-    skillsLoaded = true; 
+  if (!skillsLoaded) {
+    await skillManager.loadSkills();
+    skillsLoaded = true;
   }
 }
 import type { AIClient, ToolHandler, ToolDefinition } from "../ai/types.js";
@@ -14,13 +14,11 @@ import type { ChannelRegistry } from "../channels/registry.js";
 import type { Config } from "../config/env.js";
 import type { CronManager } from "../plugins/cron.js";
 import { registerStream, deregisterStream } from "./active-streams.js";
-import { createApproval } from "./approval.js";
 import { hookRegistry, initHooks } from "../hooks/index.js";
 import path from "node:path";
 import fs from "node:fs";
 import { classifyComplexity, selectModel } from "../ai/router.js";
 import type { BrowserManager } from "../plugins/browser.js";
-import { SkillLoader } from "../ai/skill-loader.js";
 import type { ContextManager } from "../core/context.js";
 
 initHooks();
@@ -92,7 +90,73 @@ export async function handleInbound(
 
   // Session
   const sessionKey = sessionManager.getOrCreate(msg.channel, msg.userId, msg.chatId);
-  const history = opts.noHistory ? [] : sessionManager.getHistory(sessionKey);
+  let history = opts.noHistory ? [] : sessionManager.getHistory(sessionKey);
+
+  // Helper: Hiển thị tiến trình UI
+  let progressMsgId: string | undefined;
+  let keepAliveCallback: (() => void) | undefined;
+  const sendProgress = async (text?: string) => {
+    try {
+      if (!progressMsgId) {
+        progressMsgId = await channel.send({
+          channel: msg.channel,
+          chatId: msg.chatId,
+          text: `⏳ Đang xử lý...`,
+          isFinal: false
+        });
+      } else if (text && channel.send) {
+        try {
+          await channel.send({
+            channel: msg.channel,
+            chatId: msg.chatId,
+            text: `⏳ ${text}`,
+            isFinal: false,
+            editMessageId: progressMsgId
+          });
+        } catch (err: any) { }
+      }
+    } catch { }
+  };
+
+  // 1. NGHI THỨC NÉN BỘ NHỚ (COGNITIVE COMPRESSION M1)
+  // Nếu số tin nhắn trong DB dài hơn 20 (gấp đôi vì User + Assistant = 10 Turns) -> Vượt ngưỡng -> Cuộn ép
+  if (history.length >= 20 && !opts.noHistory) {
+      await sendProgress("🧠 Đang cuộn ép trí nhớ (Memory Compression) chống tràn Context...");
+      try {
+          // Lấy 20000 chars để tóm tắt thôi để đỡ chết API
+          const historyText = history.map(h => `${h.role}: ${typeof h.content === 'string' ? h.content : JSON.stringify(h.content)}`).join("\n").substring(0, 30000);
+          
+          let compressedMemory = "";
+          const stream = aiClient.stream({
+              history: [],
+              userMessage: `Hãy tóm tắt ngắn gọn hội thoại 10 turns sau thành Bullet Points. CHỈ MÓC LẤY: 1. Mục tiêu cuối của User là gì? 2. Đã chốt quyết định nào? 3. Đã thử Tool nào bị fail? Cấm giải thích lân la.\n\n${historyText}`,
+              model: "gemini-2.5-flash", // Dùng model nhỏ tiết kiệm chi phí cho Router
+              maxTokens: 500,
+              systemPrompt: "Bạn là AI Quản trị lõi Trí nhớ (Cognitive Memory). Ép mọi thứ lại cho Hệ Thống đọc dễ hiểu."
+          });
+          
+          for await (const chunk of stream) {
+             if (chunk.type === "delta" && chunk.delta) compressedMemory += chunk.delta;
+          }
+          
+          // Xóa toàn bộ Data Rác rườm rà
+          sessionManager.reset(sessionKey);
+          // Lưu lại Hạt nhân cốt lõi làm mốc thời gian vĩnh cửu
+          sessionManager.appendFullTurn(sessionKey, {
+              role: "user",
+              content: `_[Hệ thống: Đây là cuộn nén ký ức (Memory Compression) của 10 lượt chat cũ. Đọc cái này thay vì lịch sử gốc đầy rác!]_\n\n${compressedMemory}`
+          });
+          sessionManager.appendFullTurn(sessionKey, {
+              role: "assistant",
+              content: "Đã nạp toàn bộ Tóm tắt Lịch sử vào não. Tôi đã sẵn sàng nối tiếp công việc. Mời Sếp ra lệnh."
+          });
+          
+          // Làm mới lại luồng Lịch sử cho Phiên hiện tại
+          history = sessionManager.getHistory(sessionKey);
+      } catch (e: any) {
+          console.error("[Memory Compress] Lỗi khi nén dữ liệu:", e.message);
+      }
+  }
 
   // Inject system note for Img2Img uploaded files
   const uploadedImagePath = typeof raw?.uploadedImagePath === "string" ? raw.uploadedImagePath : undefined;
@@ -103,40 +167,20 @@ export async function handleInbound(
   // We don't save the user turn here anymore to avoid duplicate context, it will be saved at the end if the request succeeds.
 
   // Register abort controller
-  const controller = registerStream(msg.chatId);
+  const streamKey = msg.text.includes("[ĐỐC CÔNG XỬ LÝ]") || msg.text.includes("[Nhịp tim hệ thống]") || msg.text.includes("cron") ? `worker_${msg.chatId}` : msg.chatId;
+  const controller = registerStream(streamKey);
 
-  // Helper: Hiển thị tiến trình UI rõ ràng giúp người dùng hết cảm giác bị mù (Blind UX)
-  let progressMsgId: string | undefined;
-  let keepAliveCallback: (() => void) | undefined;
-  const sendProgress = async (text?: string) => {
-    try {
-      if (!progressMsgId) {
-        progressMsgId = await channel.send({ 
-          channel: msg.channel, 
-          chatId: msg.chatId, 
-          text: `⏳ Đang xử lý...`, 
-          isFinal: false 
-        });
-      } else if (text && channel.send) {
-        // Cập nhật trạng thái Tool thật sự để User có thể đọc thay vì "Không update text nữa"
-        await channel.send({ 
-          channel: msg.channel, 
-          chatId: msg.chatId, 
-          text: `⏳ ${text}`, 
-          isFinal: false, 
-          editMessageId: progressMsgId 
-        });
-      }
-    } catch { /* ignore */ }
-  };
+  // Đã đưa sendProgress lên Scope đầu hàm (trước Logic Memory Compress) để tái sử dụng.
 
   // Ensure dynamic skills are loaded
   await ensureSkillsLoaded();
 
   // Tool executor
   const skContext = { msg, sendProgress };
-  const baseToolHandler = skillManager.createToolHandler(deps, skContext);
-  
+  const isWorkerTrigger = msg.text.includes("[Nhịp tim hệ thống]") || msg.text.includes("cron") || msg.channel === "cron" || msg.text.includes("[ĐỐC CÔNG XỬ LÝ]");
+  const agentRole = isWorkerTrigger ? "worker" : "frontdesk";
+  const baseToolHandler = skillManager.createToolHandler(deps, skContext, agentRole);
+
   const toolHandler: ToolHandler = {
     tools: baseToolHandler.tools,
     execute: async (name, input): Promise<string> => {
@@ -153,7 +197,7 @@ export async function handleInbound(
           deps,
           historySize: history.length,
         };
-      
+
         const hookRes = await hookRegistry.runPreToolUse(hookCtx, name, i);
         if (!hookRes.allowed) {
           return hookRes.reason ?? "Execution blocked by hook.";
@@ -187,6 +231,13 @@ export async function handleInbound(
   const userBlock = userContent ? `\n<user_context>\n${userContent}\n</user_context>` : "";
   const memoryBlock = memoryContent ? `\n<working_memory>\n[MEMORY]\n${memoryContent}\n</working_memory>` : "";
 
+  // 3. Đọc dữ liệu Phẫu thuật Nhận thức (Cognitive Refactoring) - Repo Map & Rules
+  const repoMapContent = safeReadTrimmed(path.join(deps.config.workspaceDir, ".repo_map.md"), 6000);
+  const repoMapBlock = repoMapContent ? `\n<repo_map>\n${repoMapContent}\n</repo_map>` : "";
+  
+  const rulesContent = safeReadTrimmed(path.join(deps.config.workspaceDir, ".clawbotrules"), 2000);
+  const rulesBlock = rulesContent ? `\n<project_rules>\n${rulesContent}\n</project_rules>` : "";
+
   // Thay thế hardcoded dynamicContext bằng luồng SessionStart Hooks
   const hookCtx = {
     chatId: msg.chatId,
@@ -198,12 +249,31 @@ export async function handleInbound(
   const dynamicContextText = await hookRegistry.runSessionStart(hookCtx);
   const dynamicContext = dynamicContextText ? `\n<dynamic_context>\n${dynamicContextText}\n</dynamic_context>` : "";
 
+
+
+  let roleBlock = "";
+  if (isWorkerTrigger) {
+    roleBlock = `\n<agent_role>\n[HỆ THỐNG]: Bạn đang được đánh thức bởi System Cron (Đồng hồ sinh học). Hãy tự động làm các công việc cần thiết và báo cáo kết quả cho người dùng.\n</agent_role>`;
+  }
+
   // ─── Model routing — tự chọn model theo độ phức tạp ─────────────────────
   const complexity = classifyComplexity(msg.text, history);
   const selectedModel = selectModel(complexity, config.model);
   console.log(`[router] complexity=${complexity} model=${selectedModel} msg="${msg.text.slice(0, 40)}..."`);
 
-  const dynamicSystemPrompt = config.systemPrompt + soulBlock + userBlock + memoryBlock + dynamicContext;
+  // 4. Bơm Giao Thức Chống Ảo Giác (Cognitive Engine: S2-Uncertainty & P2-Tracker)
+  const cognitiveLayers = `
+<cognitive_protocols>
+1. UNCERTAINTY EXPRESSION (BẮT BUỘC):
+- Khi bạn khẳng định một kiên thức Code hoặc Logic mà bạn không chắc chắn 100%, PHẢI đánh dấu [INFERRED] (Suy luận) hoặc [VERIFY] (Cần kiểm chứng) ở cuối câu đó.
+- CẤM nói giọng tự tin khi không có dữ liệu thực tế. Thừa nhận "Tôi không có đủ thông tin" nếu cần.
+
+2. EXECUTION DRIFT TRACKER:
+- Mọi Task được giao đều MẶC ĐỊNH phải sinh ra 3 Bước thực thi từ ban đầu.
+- Khi làm xong mỗi bước, hãy tự đánh giá: "Kết quả có đúng mục tiêu gốc không? Có bị lệch hướng (DRIFT) không?". Nếu có thì BẮT BUỘC PHẢI DỪNG LẠI RE-PLAN (Lập kế hoạch lại) thay vì đâm đầu làm tiếp cái sai.
+</cognitive_protocols>`;
+
+  const dynamicSystemPrompt = config.systemPrompt + soulBlock + userBlock + memoryBlock + repoMapBlock + rulesBlock + dynamicContext + roleBlock + cognitiveLayers;
 
   // Begin streaming — tự động retry khi server overloaded (529)
   let overloadAttempt = 0;
@@ -246,7 +316,7 @@ export async function handleInbound(
         })) {
           // Bắt lỗi Abort do timeout nếu SDK ngâm không chịu nhả error event ngay
           if (loopController.signal.aborted && event.type !== "error") {
-             throw new Error("Timeout_Google_API");
+            throw new Error("Timeout_Google_API");
           }
 
           if (event.type === "delta" || event.type === "heartbeat") {
@@ -278,24 +348,26 @@ export async function handleInbound(
 
         if (isAbort) {
           await streamHandle?.abort();
-          await channel.send({
-            channel: msg.channel,
-            chatId: msg.chatId,
-            text: "⚠️ Trí tuệ Gemma 4 đã tịt ngòi 300 giây (Chạm mốc Idle Timeout). Chắc do file context bạn gửi quá khổng lồ khiến AI mất hơn 5 phút chỉ để đọc! Đã tự động ngắt kết nối an toàn.",
-            isFinal: true,
-          });
+          if (err instanceof Error && err.message.includes("Timeout_Google_API")) {
+            await channel.send({
+              channel: msg.channel,
+              chatId: msg.chatId,
+              text: "⚠️ Trí tuệ Gemma 4 đã tịt ngòi 300 giây (Chạm mốc Idle Timeout). Chắc do file context bạn gửi quá khổng lồ khiến AI mất hơn 5 phút chỉ để đọc! Đã tự động ngắt kết nối an toàn.",
+              isFinal: true,
+            });
+          }
           return;
         }
-
-        console.error("[pipeline] AI error:", err);
-        await streamHandle?.abort();
 
         const isOverloaded =
           err instanceof Error && (
             err.message.includes("overloaded_error") ||
             err.message.toLowerCase().includes("overloaded") ||
-            (err as any).status === 529
+            (err as any).status === 529 || err.message.includes("503") || err.message.includes("502") || err.message.includes("500") || (err as any).status === 503 || (err as any).status === 502 || (err as any).status === 500
           );
+
+        console.error("[pipeline] AI error:", err);
+        await streamHandle?.abort(isOverloaded);
 
         if (isOverloaded && overloadAttempt < MAX_OVERLOAD_RETRIES) {
           overloadAttempt++;
@@ -305,12 +377,19 @@ export async function handleInbound(
           continue;
         }
 
+        const errMsg = err instanceof Error ? err.message : String(err);
+        
+        if (errMsg.includes("429") && errMsg.includes("Too Many Requests")) {
+           console.warn("[pipeline] Bỏ qua lỗi Telegram Rate Limit 429 để bảo toàn dòng chảy AI:", errMsg);
+           break; // Vẫn tính là xong luồng vì đằng nào data cũng ghi ổ cứng rồi
+        }
+
         await channel.send({
           channel: msg.channel,
           chatId: msg.chatId,
           text: isOverloaded
             ? "Server API đang quá tải hoặc gặp giới hạn, vui lòng thử lại sau ít phút."
-            : `[Lỗi API]: ${err instanceof Error ? err.message : String(err)}`,
+            : `[Lỗi API]: ${errMsg}`,
           isFinal: true,
         });
         return;
@@ -319,20 +398,22 @@ export async function handleInbound(
       }
     }
   } finally {
-    deregisterStream(msg.chatId);
+    deregisterStream(streamKey);
     if (progressMsgId && channel.id === "telegram") {
-      try { await (channel as any).bot.api.deleteMessage(msg.chatId, Number(progressMsgId)); } catch {}
+      try { await (channel as any).bot.api.deleteMessage(msg.chatId, Number(progressMsgId)); } catch { }
     }
 
     // Lưu lại đoạn hội thoại partial/final của bot vào lịch sử để Bot nhớ nó đã làm gì trước khi bị tắt ngang.
     if (!opts.noHistory) {
-      if (finalAssistantMessages && finalAssistantMessages.length > 0) {
+      const isWorker = msg.text.includes("[ĐỐC CÔNG XỬ LÝ]") || msg.text.includes("[Nhịp tim hệ thống]") || msg.text.includes("cron");
+      if (finalAssistantMessages && finalAssistantMessages.length > 0 && !isWorker) {
         for (const message of finalAssistantMessages) {
           if (message.role === "assistant" || message.role === "tool") {
             sessionManager.appendFullTurn(sessionKey, message);
           }
         }
       } else if (fullText) {
+        // Đối với Worker, chỉ lưu báo cáo cuối cùng để giữ lịch sử sạch sẽ, tránh nghẽn API
         sessionManager.appendAssistantTurn(sessionKey, fullText);
       }
     }

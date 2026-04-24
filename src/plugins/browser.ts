@@ -1,5 +1,10 @@
-import { chromium, BrowserContext, Page } from 'playwright';
+import { BrowserContext, Page } from 'playwright';
+import { chromium } from 'playwright-extra';
+// @ts-ignore
+import stealth from 'puppeteer-extra-plugin-stealth';
 import path from 'node:path';
+
+chromium.use(stealth());
 
 export class BrowserManager {
   private context: BrowserContext | null = null;

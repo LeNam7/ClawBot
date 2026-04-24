@@ -189,7 +189,7 @@ export class TelegramChannel implements IChannel {
   }
 
   async start(): Promise<void> {
-    void this.bot.start({ drop_pending_updates: true });
+    void this.bot.start();
     console.log("[telegram] bot started (polling)");
   }
 
@@ -251,20 +251,35 @@ export class TelegramChannel implements IChannel {
   }
 
   async sendDocument(chatId: string, content: string, filename: string, caption?: string): Promise<void> {
-    const buf = Buffer.from(content, "utf8");
-    await this.bot.api.sendDocument(
-      Number(chatId),
-      new InputFile(buf, filename),
-      caption ? { caption } : undefined
-    );
+    try {
+      const buf = Buffer.from(content, "utf8");
+      await this.bot.api.sendDocument(
+        Number(chatId),
+        new InputFile(buf, filename),
+        caption ? { caption } : undefined
+      );
+    } catch (err: any) {
+      console.error(`[telegram] sendDocument failed (rate limit?):`, err.message);
+      // Fallback: Notify user that sending doc failed due to rate limit
+      try {
+        await this.bot.api.sendMessage(Number(chatId), `⚠️ Lỗi xuất file \`${filename}\`: Telegram Rate Limit (429). File đã được ghi vào Ổ CỨNG nội bộ nhưng không thể đẩy qua chat.`);
+      } catch {}
+    }
   }
 
   async sendFileBuffer(chatId: string, buffer: Buffer, filename: string, caption?: string): Promise<void> {
-    await this.bot.api.sendDocument(
-      Number(chatId),
-      new InputFile(buffer, filename),
-      caption ? { caption } : undefined
-    );
+    try {
+      await this.bot.api.sendDocument(
+        Number(chatId),
+        new InputFile(buffer, filename),
+        caption ? { caption } : undefined
+      );
+    } catch (err: any) {
+      console.error(`[telegram] sendFileBuffer failed (rate limit?):`, err.message);
+      try {
+        await this.bot.api.sendMessage(Number(chatId), `⚠️ Lỗi xuất file \`${filename}\`: Telegram Rate Limit (429). Vui lòng gửi lại yêu cầu xuất file lát sau.`);
+      } catch {}
+    }
   }
 
   beginStream(chatId: string): StreamHandle {

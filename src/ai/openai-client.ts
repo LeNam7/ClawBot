@@ -30,6 +30,7 @@ export class OpenAIClient implements AIClient {
       let currentMessages = buildMessages(req);
       const tools = req.toolHandler?.tools.map(toOpenAITool) ?? [];
       const MAX_STEPS = 100; // Mở khóa sức mạnh trâu bò cho Autonomous Agent
+      let emptyTextCount = 0; // Track số lần AI rơi vào watchdog loop
 
       for (let step = 0; step < MAX_STEPS; step++) {
         const params: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
@@ -147,6 +148,9 @@ export class OpenAIClient implements AIClient {
           const toolResultMsgs: OpenAI.Chat.ChatCompletionToolMessageParam[] = [];
 
           for (const tc of toolCalls) {
+            // Fix AI hallucination: sanitize tool name (e.g., "write_//file" -> "write_file")
+            tc.name = (tc.name || "").replace(/[^a-zA-Z0-9_-]/g, "").replace(/__+/g, "_");
+
             let input: unknown;
             try {
               input = JSON.parse(tc.arguments || "{}");
@@ -191,9 +195,12 @@ export class OpenAIClient implements AIClient {
             };
           });
 
+          let cleanStepText = stepText || "";
+          cleanStepText = cleanStepText.replace(/<thought>[\s\S]*?<\/thought>/g, "[Suy nghĩ bị ẩn để tối ưu API]");
+          
           const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = {
             role: "assistant",
-            content: stepText || null, // FIX 400 error schema requirements
+            content: cleanStepText || null, // FIX 400 error schema requirements
             tool_calls: assistantToolCalls,
           };
 
@@ -215,13 +222,18 @@ export class OpenAIClient implements AIClient {
           
           console.log(`[step ${step}] No tool calls. visibleText=`, visibleText === "" ? "EMPTY" : visibleText.substring(0,20));
           if (visibleText === "") {
+             emptyTextCount++;
+             if (emptyTextCount >= 3) {
+                 console.log(`[step ${step}] Watchdog triggered too many times (${emptyTextCount}). Breaking loop to prevent API spam.`);
+                 break;
+             }
              const assistantMsg: OpenAI.Chat.ChatCompletionAssistantMessageParam = { role: "assistant", content: stepText || "" };
              const systemNudge: OpenAI.Chat.ChatCompletionUserMessageParam = { 
                role: "user", 
-               content: "[Hệ thống tự động nhắc nhở]: Bạn vừa phân tích trong thẻ thought nhưng lại QUÊN không gọi bất kỳ tool nào (ví dụ manage_tasks, write_file) hoặc quên trả lời cho tôi. BẮT BUỘC gọi tool ở định dạng JSON để tiến hành bước tiếp theo." 
+               content: `[Hệ thống tự động nhắc nhở] (Cảnh báo ${emptyTextCount}/3): Bạn không gọi bất kỳ tool nào và cũng không có phản hồi bằng văn bản. Nếu không còn gì làm, hãy trả lời phản hồi cho USER.` 
              };
              currentMessages = [...currentMessages, assistantMsg, systemNudge];
-             console.log(`[step ${step}] WATCHDOG TICKED! currentMessages.length now:`, currentMessages.length);
+             console.log(`[step ${step}] WATCHDOG TICKED (${emptyTextCount})! currentMessages.length now:`, currentMessages.length);
              continue;
           }
           
@@ -258,7 +270,12 @@ function buildMessages(req: AIRequest): OpenAI.Chat.ChatCompletionMessageParam[]
 
   for (const h of req.history) {
     if (h.role === "assistant") {
-      msgs.push({ role: h.role, content: h.content, tool_calls: h.tool_calls as any });
+      let cleanedContent = h.content;
+      if (typeof cleanedContent === "string") {
+         // Xóa sạch rác tư duy cũ, chỉ giữ lại câu cú thực sự để tiết kiệm 60% Token!
+         cleanedContent = cleanedContent.replace(/<thought>[\s\S]*?<\/thought>/g, "[Đã suy nghĩ]");
+      }
+      msgs.push({ role: h.role, content: cleanedContent, tool_calls: h.tool_calls as any });
     } else if (h.role === "tool") {
       msgs.push({ role: h.role, content: h.content, tool_call_id: h.tool_call_id as string });
     } else {

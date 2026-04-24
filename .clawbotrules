@@ -1,0 +1,21 @@
+# 🏗️ BỘ QUY TẮC KIẾN TRÚC DỰ ÁN (CLAWBOT RULES)
+
+Đây là file ghi nhớ Cấu trúc dự án và Quy tắc lập trình được chia sẻ giữa User và Coder AI (Clawbot).
+
+## 1. THÔNG TIN CORE DỰ ÁN
+- Node.js + TypeScript.
+- Entrypoint chính: `src/index.ts`
+- Cấu trúc thư mục: 
+  - `src/core/`: Các kiểu và module sống còn.
+  - `src/ai/`: Lõi gọi qua API LLM.
+  - `src/pipeline/`: Đường dẫn dữ liệu từ Telegram đập luồng vào AI.
+  - `src/skills/`: Toàn bộ công cụ của AI đều nằm dạng module ở đây.
+  - `src/db/`: Lưu trữ dữ liệu Local/Sqlite3 (Không có Postgres).
+
+## 2. QUY TẮC PHÁT TRIỂN & XỬ LÝ LỖI
+- Cấm tự ý sửa đổi code Lõi (`src/ai/openai-client.ts` hoặc `src/pipeline/handler.ts`) mà không CÓ SỰ XÁC NHẬN RÕ RÀNG của sếp NT777.
+- Luôn ưu tiên dùng Tool `read_symbol` thu thập thông tin thay vì dùng `read_file` ngốn tài nguyên.
+- Nếu vướng Lỗi Terminal Compiler báo Đỏ ở Tool CodeVerifier: BẮT BUỘC phải dùng luồng tư duy `<thought>` phân tích dòng báo lỗi của hệ điều hành, tìm nguyên nhân thay vì nhắm mắt sửa bừa. KHÔNG ĐƯỢC làm lơ Compiler.
+- Trình bày code và câu trả lời phải ngắn gọn, không lan man, không xin lỗi dài dòng. Tập trung vào Data!
+
+> System Memory sẽ thu thập file này mỗi lần reset phiên. Hãy cập nhật thêm Technical Notes vào file này nếu thấy luồng logic nào quá mập mờ mà Sếp không viết document!

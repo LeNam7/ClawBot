@@ -32,13 +32,34 @@ export class SkillManager {
     try {
       await fs.mkdir(this.skillsDir, { recursive: true });
       
-      const files = await fs.readdir(this.skillsDir);
-      const skillFiles = files.filter(f => f.endsWith(".ts") || f.endsWith(".js"));
+      const items = await fs.readdir(this.skillsDir, { withFileTypes: true });
 
-      for (const file of skillFiles) {
-        if (file === "manager.ts" || file === "manager.js" || file === "types.ts") continue;
+      for (const item of items) {
+        if (item.name === "manager.ts" || item.name === "manager.js" || item.name === "types.ts") continue;
 
-        const filePath = path.join(this.skillsDir, file);
+        let filePath = "";
+        let folderPath = "";
+
+        if (item.isDirectory()) {
+          folderPath = path.join(this.skillsDir, item.name);
+          // Auto-detect .ts or .js index file
+          filePath = path.join(folderPath, "index.ts");
+          try {
+            await fs.access(filePath);
+          } catch {
+            filePath = path.join(folderPath, "index.js");
+            try {
+              await fs.access(filePath);
+            } catch {
+              continue; // Skip because no index file found
+            }
+          }
+        } else if (item.name.endsWith(".ts") || item.name.endsWith(".js")) {
+          filePath = path.join(this.skillsDir, item.name);
+        } else {
+          continue;
+        }
+
         const importUrl = `file://${filePath.replace(/\\/g, '/')}`;
 
         try {
@@ -46,14 +67,25 @@ export class SkillManager {
           const skill = module.default as Skill;
 
           if (!skill || !skill.name || !skill.execute) {
-            console.warn(`[skill-manager] file ${file} does not export a valid Skill (missing name or execute).`);
+            console.warn(`[skill-manager] ${item.name} does not export a valid Skill.`);
             continue;
+          }
+
+          // Ghi đè Description từ tệp SKILL.md (nếu có)
+          if (folderPath) {
+            const mdPath = path.join(folderPath, "SKILL.md");
+            try {
+              const mdContent = await fs.readFile(mdPath, "utf8");
+              if (mdContent.trim()) {
+                skill.description = mdContent;
+              }
+            } catch {} // Bỏ qua nếu không có file .md thiết lập
           }
 
           this.skills.set(skill.name, skill);
           console.log(`[skill-manager] loaded skill: ${skill.name}`);
         } catch (err) {
-          console.error(`[skill-manager] failed to load ${file}:`, err);
+          console.error(`[skill-manager] failed to load ${item.name}:`, err);
         }
       }
     } catch (err) {
@@ -61,12 +93,16 @@ export class SkillManager {
     }
   }
 
-  createToolHandler(deps: HandlerDeps, ctx: SkillContext): ToolHandler {
-    const localTools = Array.from(this.skills.values()).map(s => ({
-      name: s.name,
-      description: s.description,
-      input_schema: s.input_schema
-    }));
+  createToolHandler(deps: HandlerDeps, ctx: SkillContext, role: "frontdesk" | "worker" = "worker"): ToolHandler {
+    const allowedFrontdeskTools = ["memory_search", "notion_manager", "delegate_task", "get_weather"];
+    
+    const localTools = Array.from(this.skills.values())
+      .filter(s => role === "worker" || allowedFrontdeskTools.includes(s.name))
+      .map(s => ({
+        name: s.name,
+        description: s.description,
+        input_schema: s.input_schema
+      }));
 
     return {
       tools: localTools,
@@ -80,8 +116,7 @@ export class SkillManager {
             return `Lỗi thực thi kỹ năng "${name}": ${err.message}`;
           }
         }
-
-        throw new Error(`Skill "${name}" not found.`);
+        return `[HỆ THỐNG]: Tên Tool bị sai hoặc AI đang bị ảo giác (Tool "${name}" không tồn tại). Yêu cầu AI giữ thái độ chuyên nghiệp, tuyệt đối KHÔNG NHÉT CHỮ VÀO TÊN TOOL (name). Chỉ được xuất đúng tên Tool có phân loại sẵn như write_file, delegate_task, v.v.. Hãy gọi lại ngay Tool đúng.`;
       }
     };
   }

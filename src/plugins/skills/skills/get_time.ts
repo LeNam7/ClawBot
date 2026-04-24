@@ -1,4 +1,4 @@
-import { ISkill } from "../types.ts";
+import { ISkill } from "../types.js";
 import { z } from "zod";
 
 const GetTimeSchema = z.object({

@@ -10,10 +10,12 @@ import { handleInbound, ensureSkillsLoaded } from "./pipeline/handler.js";
 import type { HandlerDeps } from "./pipeline/handler.js";
 import { createServer } from "./gateway/server.js";
 import { CronManager } from "./plugins/cron.js";
+import { Cron } from "croner";
 import { SecurityManager } from "./core/security.js";
 import { BrowserManager } from "./plugins/browser.js";
 import { ContextManager } from "./core/context.js";
 import path from "node:path";
+import fs from "node:fs/promises";
 
 async function main() {
   console.log("[clawbot] starting...");
@@ -107,6 +109,43 @@ async function main() {
       browserManager,
     });
   }
+
+  // 7.5 Bioclock System Crons (Proactive Engine)
+  if (config.adminUserId && config.systemCrons && config.systemCrons.length > 0) {
+    config.systemCrons.forEach((expression) => {
+      try {
+        new Cron(expression, { timezone: "Asia/Ho_Chi_Minh" }, async () => {
+          console.log(`[system_cron] Firing biological clock: ${expression}`);
+
+          // Cào vội danh sách Tasks để nhét thẳng vào não Bot (Đỡ tốn 1 Request gọi Tool)
+          let tasksData = "[]";
+          try {
+            const tasksFile = path.join(config.workspaceDir, "tasks.json");
+            tasksData = await fs.readFile(tasksFile, "utf8");
+          } catch {
+            tasksData = "Không có task nào.";
+          }
+
+          await handleInbound(
+            {
+              id: `bioclock:${Date.now()}`,
+              channel: "telegram",
+              userId: config.adminUserId!,
+              chatId: config.adminUserId!,
+              text: `[HỆ THỐNG PROACTIVE]: Đồng hồ sinh học báo thức. Phụ lục Danh sách Việc Cần Làm (Task Queue) hiện tại (JSON) là: \n\`\`\`json\n${tasksData}\n\`\`\`\n\nQuy tắc Dẫn dắt: Hãy đọc List trên. Nếu có task tới hạn, HÃY CÀO/XỬ LÝ LUÔN. Xong việc thì Update status sang "done". Không báo cáo trung gian ("đang làm", "đang điều tra") gây lãng phí Token! Cấm im lặng.`,
+              receivedAt: new Date().toISOString(),
+              raw: null,
+            },
+            deps
+          );
+        });
+      } catch (err) {
+        console.error(`[system_cron] Invalid Cron expression "${expression}":`, err);
+      }
+    });
+    console.log(`[clawbot] proactive bioclock: ${config.systemCrons.length} rhythms`);
+  }
+
 
   // 8. Start channels
   const startPromises = registry.getAll().map(c => c.start());
